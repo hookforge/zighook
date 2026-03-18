@@ -12,6 +12,7 @@
 const std = @import("std");
 
 const HookError = @import("error.zig").HookError;
+const aarch64 = @import("arch/aarch64.zig");
 const context = @import("context.zig");
 const state = @import("state.zig");
 const memory = @import("memory.zig");
@@ -83,7 +84,7 @@ fn chainPrevious(signum: c_int, info: *const std.c.siginfo_t, uctx: ?*anyopaque)
 /// Callback contract:
 /// - if the callback overwrites `ctx.pc`, zighook respects that decision
 /// - otherwise `inline_hook` returns to `lr`
-/// - otherwise `instrument` continues via the replay trampoline
+/// - otherwise `instrument` uses the precomputed replay plan
 /// - otherwise `instrument_no_original` skips to the next instruction
 fn handleTrapAarch64(address: u64, ctx: *context.HookContext) bool {
     const slot = state.slotByAddress(address) orelse return false;
@@ -101,7 +102,11 @@ fn handleTrapAarch64(address: u64, ctx: *context.HookContext) bool {
 
     const next_pc = address + slot.step_len;
     if (slot.execute_original) {
-        ctx.pc = slot.trampoline_pc;
+        if (slot.replay_plan.requiresTrampoline()) {
+            ctx.pc = slot.trampoline_pc;
+        } else {
+            aarch64.applyReplay(slot.replay_plan, address, ctx) catch return false;
+        }
     } else {
         ctx.pc = next_pc;
     }
@@ -112,9 +117,10 @@ fn handleTrapAarch64(address: u64, ctx: *context.HookContext) bool {
 ///
 /// The handler does not allocate and only performs a small amount of work:
 /// - recover the trapped PC from `ucontext`
+/// - copy Darwin machine state into the public callback layout
 /// - verify that the instruction at that PC is still `brk`
 /// - dispatch to the registered callback
-/// - rewrite `ctx.pc` so execution resumes as requested
+/// - write the edited context back so execution resumes as requested
 fn trapHandler(signum: c_int, info: *const std.c.siginfo_t, uctx_opaque: ?*anyopaque) callconv(.c) void {
     if (uctx_opaque == null) {
         chainPrevious(signum, info, uctx_opaque);
@@ -126,7 +132,7 @@ fn trapHandler(signum: c_int, info: *const std.c.siginfo_t, uctx_opaque: ?*anyop
     // used by `std.debug` and treat the outer frame as byte-aligned.
     const uctx: *align(1) std.c.ucontext_t = @ptrCast(uctx_opaque.?);
     const mcontext = uctx.mcontext;
-    const ctx = context.fromThreadState(&mcontext.ss);
+    var ctx = context.captureMachineContext(mcontext);
     const trap_address = ctx.pc;
 
     const opcode = memory.readU32(trap_address) catch {
@@ -138,9 +144,12 @@ fn trapHandler(signum: c_int, info: *const std.c.siginfo_t, uctx_opaque: ?*anyop
         return;
     }
 
-    if (!handleTrapAarch64(trap_address, ctx)) {
+    if (!handleTrapAarch64(trap_address, &ctx)) {
         chainPrevious(signum, info, uctx_opaque);
+        return;
     }
+
+    context.writeBackMachineContext(mcontext, &ctx);
 }
 
 fn installSignal(signum: c_int) HookError!void {

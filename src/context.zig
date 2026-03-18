@@ -1,19 +1,28 @@
 //! Public register context layout exposed to hook callbacks.
 //!
-//! The layout intentionally mirrors the Rust version:
-//! - `regs.x[i]` gives indexed access
-//! - `regs.named.x0 ... x30` gives named access
-//! - `sp`, `pc`, and `cpsr` are mapped directly from Darwin thread state
+//! The Zig rewrite keeps this layout intentionally close to the Rust crate:
+//! - `regs.x[i]` gives indexed access to x0..x30
+//! - `regs.named.x0 ... x30` gives named access to the same registers
+//! - `sp`, `pc`, and `cpsr` expose the architectural integer control state
+//! - `fpregs.v[i]` exposes the raw 128-bit bits of `v0..v31`
+//! - `fpregs.fpsr` / `fpregs.fpcr` expose the floating-point status/control
+//!   registers
 //!
-//! On Apple Silicon macOS, this layout is binary-compatible with the Darwin
-//! thread-state payload stored in `std.c.mcontext_t.ss`. That lets the signal
-//! handler reinterpret the kernel-provided machine context without heap
-//! allocation or per-register copies.
+//! Darwin splits this information across two machine-context payloads:
+//! - `mcontext.ss` for general-purpose state
+//! - `mcontext.ns` for NEON / FP state
+//!
+//! We therefore use an explicit remap and write-back step in the signal
+//! handler instead of reinterpreting a single kernel struct in place. The copy
+//! is small, stays on the stack, and keeps the public callback ABI independent
+//! from the exact Darwin field layout.
 
 const std = @import("std");
 
 /// Darwin thread-state type used by the currently supported backend.
 const DarwinThreadState = @FieldType(std.c.mcontext_t, "ss");
+/// Darwin NEON / FP state type used by the currently supported backend.
+const DarwinNeonState = @FieldType(std.c.mcontext_t, "ns");
 
 /// Named general-purpose register view for AArch64 callbacks.
 pub const XRegistersNamed = extern struct {
@@ -56,6 +65,22 @@ pub const XRegisters = extern union {
     named: XRegistersNamed,
 };
 
+/// Raw AArch64 SIMD / floating-point register bank.
+///
+/// Each `v[i]` element stores the architectural 128-bit `vN` register bits.
+/// Callback code can reinterpret the low lanes as needed:
+/// - low 32 bits: `sN`
+/// - low 64 bits: `dN`
+/// - full 128 bits: `qN`
+pub const FpRegisters = extern struct {
+    /// Raw bits of `v0..v31`.
+    v: [32]u128,
+    /// Floating-point status register.
+    fpsr: u32,
+    /// Floating-point control register.
+    fpcr: u32,
+};
+
 /// Mutable callback context passed to every instrumentation callback.
 pub const HookContext = extern struct {
     /// General-purpose registers x0..x30.
@@ -68,22 +93,59 @@ pub const HookContext = extern struct {
     cpsr: u32,
     /// Padding required by the Darwin thread-state ABI.
     pad: u32,
+    /// Raw SIMD / floating-point state (`v0..v31`, `fpsr`, `fpcr`).
+    fpregs: FpRegisters,
 };
 
-// Refuse compilation if the public callback view ever drifts away from the
-// Darwin kernel ABI we reinterpret in the signal handler.
+// Keep the public callback layout aligned with the amount of state Darwin
+// exposes through `ss + ns`, even though we copy it explicitly.
 comptime {
-    std.debug.assert(@sizeOf(HookContext) == @sizeOf(DarwinThreadState));
-    std.debug.assert(@alignOf(HookContext) == @alignOf(DarwinThreadState));
+    std.debug.assert(@sizeOf(XRegisters) == @sizeOf([31]u64));
+    std.debug.assert(@sizeOf(FpRegisters) == @sizeOf(DarwinNeonState));
+    std.debug.assert(@alignOf(FpRegisters) == @alignOf(DarwinNeonState));
+    std.debug.assert(@sizeOf(HookContext) == @sizeOf(DarwinThreadState) + @sizeOf(DarwinNeonState));
+    std.debug.assert(@alignOf(HookContext) == @alignOf(FpRegisters));
 }
 
 /// C-callable callback type used by all runtime hook entry points.
 pub const InstrumentCallback = *const fn (address: u64, ctx: *HookContext) callconv(.c) void;
 
-/// Reinterprets Darwin `thread_state` as the public hook context.
+/// Copies Darwin machine context into the stable public callback layout.
 ///
-/// This is safe for the currently implemented backend because both layouts are
-/// intentionally binary-compatible on macOS AArch64.
-pub fn fromThreadState(thread_state: *DarwinThreadState) *HookContext {
-    return @ptrCast(thread_state);
+/// The returned value is meant to live on the signal-handler stack. That keeps
+/// callback code free to edit registers without directly mutating the Darwin
+/// structs until zighook has decided that the trap really belongs to us.
+pub fn captureMachineContext(mcontext: *const std.c.mcontext_t) HookContext {
+    var ctx = std.mem.zeroes(HookContext);
+
+    @memcpy(ctx.regs.x[0..29], mcontext.ss.regs[0..]);
+    ctx.regs.x[29] = mcontext.ss.fp;
+    ctx.regs.x[30] = mcontext.ss.lr;
+    ctx.sp = mcontext.ss.sp;
+    ctx.pc = mcontext.ss.pc;
+    ctx.cpsr = mcontext.ss.cpsr;
+    ctx.pad = mcontext.ss.__pad;
+
+    @memcpy(ctx.fpregs.v[0..], mcontext.ns.q[0..]);
+    ctx.fpregs.fpsr = mcontext.ns.fpsr;
+    ctx.fpregs.fpcr = mcontext.ns.fpcr;
+    return ctx;
+}
+
+/// Writes a callback-edited public context back into Darwin machine state.
+///
+/// This is called only after zighook has confirmed that the trap belongs to a
+/// registered hook and the callback / replay path completed successfully.
+pub fn writeBackMachineContext(mcontext: *std.c.mcontext_t, ctx: *const HookContext) void {
+    @memcpy(mcontext.ss.regs[0..], ctx.regs.x[0..29]);
+    mcontext.ss.fp = ctx.regs.x[29];
+    mcontext.ss.lr = ctx.regs.x[30];
+    mcontext.ss.sp = ctx.sp;
+    mcontext.ss.pc = ctx.pc;
+    mcontext.ss.cpsr = ctx.cpsr;
+    mcontext.ss.__pad = ctx.pad;
+
+    @memcpy(mcontext.ns.q[0..], ctx.fpregs.v[0..]);
+    mcontext.ns.fpsr = ctx.fpregs.fpsr;
+    mcontext.ns.fpcr = ctx.fpregs.fpcr;
 }

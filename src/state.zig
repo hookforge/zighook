@@ -13,6 +13,7 @@ const std = @import("std");
 
 const HookError = @import("error.zig").HookError;
 const constants = @import("constants.zig");
+const aarch64 = @import("arch/aarch64.zig");
 const context = @import("context.zig");
 const trampoline = @import("trampoline.zig");
 
@@ -45,6 +46,8 @@ pub const HookSlot = struct {
     return_to_caller: bool = false,
     /// Whether zighook itself installed the `brk` patch into the text page.
     runtime_patch_installed: bool = false,
+    /// Precomputed execute-original strategy for the displaced instruction.
+    replay_plan: aarch64.ReplayPlan = .{ .skip = {} },
     /// Address of the replay trampoline, if one was allocated.
     trampoline_pc: u64 = 0,
 };
@@ -166,6 +169,7 @@ pub fn registerHook(
     execute_original: bool,
     return_to_caller: bool,
     runtime_patch_installed: bool,
+    replay_plan: aarch64.ReplayPlan,
 ) HookError!void {
     if (address == 0 or original_bytes.len == 0 or original_bytes.len > constants.max_saved_bytes or step_len == 0) {
         return error.InvalidAddress;
@@ -180,6 +184,7 @@ pub fn registerHook(
         slot.execute_original = execute_original;
         slot.return_to_caller = return_to_caller;
         slot.runtime_patch_installed = slot.runtime_patch_installed or runtime_patch_installed;
+        slot.replay_plan = replay_plan;
 
         if (slot.original_len == 0) {
             slot.original_len = @intCast(original_bytes.len);
@@ -187,7 +192,7 @@ pub fn registerHook(
             slot.step_len = step_len;
         }
 
-        if (execute_original and slot.trampoline_pc == 0) {
+        if (execute_original and replay_plan.requiresTrampoline() and slot.trampoline_pc == 0) {
             // Trampolines are allocated lazily so `inline_hook(...)` and
             // `instrument_no_original(...)` do not pay RX memory overhead.
             slot.trampoline_pc = try trampoline.createOriginalTrampoline(
@@ -202,7 +207,7 @@ pub fn registerHook(
     }
 
     const free_index = findFreeHookIndex() orelse return error.HookSlotsFull;
-    const trampoline_pc = if (execute_original)
+    const trampoline_pc = if (execute_original and replay_plan.requiresTrampoline())
         try trampoline.createOriginalTrampoline(address, original_bytes, step_len)
     else
         0;
@@ -217,6 +222,7 @@ pub fn registerHook(
         .execute_original = execute_original,
         .return_to_caller = return_to_caller,
         .runtime_patch_installed = runtime_patch_installed,
+        .replay_plan = replay_plan,
         .trampoline_pc = trampoline_pc,
     };
 }

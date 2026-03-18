@@ -74,6 +74,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const runtime_targets_asm = b.path("examples/support/runtime_targets_aarch64_macos.S");
+    const replay_targets_asm = b.path("examples/support/replay_targets_aarch64_macos.S");
     const preload_constructor_asm = b.path("examples/preload/constructor_aarch64_macos.S");
 
     const mod = b.addModule("zighook", .{
@@ -116,6 +117,7 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
     mod_tests.root_module.addAssemblyFile(runtime_targets_asm);
+    mod_tests.root_module.addAssemblyFile(replay_targets_asm);
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
     const exe_tests = b.addTest(.{

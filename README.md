@@ -27,6 +27,8 @@ The current backend supports:
 - trap-based instrumentation via `brk`
 - signal-based entry hooks
 - jump detours
+- strict execute-original replay for common AArch64 PC-relative instructions
+- public callback access to AArch64 FP/SIMD state (`v0..v31`, `fpsr`, `fpcr`)
 - constructor-based dylib payloads for `DYLD_INSERT_LIBRARIES` / later Mach-O insertion workflows
 
 ## Status
@@ -36,6 +38,26 @@ This repository currently targets the first backend slice only:
 - `aarch64-apple-darwin`
 
 It is usable for local experiments on Apple Silicon macOS, but it is not yet at full feature/platform parity with the Rust crate.
+
+Current execute-original replay whitelist for PC-relative AArch64 instructions:
+
+- `adr`
+- `adrp`
+- `ldr (literal)` into `wN`
+- `ldr (literal)` into `xN`
+- `ldr (literal)` into `sN`
+- `ldr (literal)` into `dN`
+- `ldr (literal)` into `qN`
+- `ldrsw (literal)`
+- `prfm (literal)`
+- `b`
+- `bl`
+- `b.cond`
+- `cbz` / `cbnz`
+- `tbz` / `tbnz`
+
+Unsupported execute-original cases fail at hook-install time instead of silently
+falling back to unsafe trampoline replay.
 
 ## Build
 

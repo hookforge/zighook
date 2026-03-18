@@ -33,6 +33,7 @@ pub const HookContext = context.HookContext;
 pub const InstrumentCallback = context.InstrumentCallback;
 pub const XRegisters = context.XRegisters;
 pub const XRegistersNamed = context.XRegistersNamed;
+pub const FpRegisters = context.FpRegisters;
 
 /// How a trap-based API discovers the original instruction bytes it should
 /// remember and, optionally, replay.
@@ -96,6 +97,11 @@ pub fn patch_bytes(allocator: std.mem.Allocator, address: u64, bytes: []const u8
 /// - your callback sees and may edit the live register context
 /// - if it leaves `ctx.pc` unchanged, zighook executes the trapped instruction
 /// - execution then resumes at the following instruction
+///
+/// Execute-original mode is strict. At install time zighook either:
+/// - proves that the displaced opcode is trampoline-safe
+/// - recognizes a supported PC-relative opcode and installs an emulation plan
+/// - or returns a replay-related installation error before patching code
 pub fn instrument(address: u64, callback: InstrumentCallback) HookError!u32 {
     return instrumentInternal(address, callback, true, false, .runtime_patch);
 }
@@ -235,6 +241,11 @@ fn instrumentInternal(
     return_to_caller: bool,
     install_mode: InstallMode,
 ) HookError!u32 {
+    const replay_plan = if (execute_original)
+        try planExecuteOriginalReplay(address)
+    else
+        aarch64.ReplayPlan{ .skip = {} };
+
     if (state.slotByAddress(address)) |slot| {
         // Re-registering the same address updates callback policy in-place.
         try state.registerHook(
@@ -245,6 +256,7 @@ fn instrumentInternal(
             execute_original,
             return_to_caller,
             install_mode == .runtime_patch,
+            replay_plan,
         );
 
         return state.cachedOriginalOpcode(address) orelse
@@ -292,6 +304,7 @@ fn instrumentInternal(
         execute_original,
         return_to_caller,
         runtime_patch_installed,
+        replay_plan,
     ) catch |err| {
         if (runtime_patch_installed) {
             _ = memory.patchU32(address, saved_opcode) catch {};
@@ -305,9 +318,46 @@ fn instrumentInternal(
     return saved_opcode;
 }
 
+/// Decides how `instrument(...)` should execute the displaced instruction.
+///
+/// The decision is made before runtime state is registered so unsupported
+/// execute-original cases fail early, before any executable page is modified.
+fn planExecuteOriginalReplay(address: u64) HookError!aarch64.ReplayPlan {
+    const opcode = state.cachedOriginalOpcode(address) orelse try memory.readU32(address);
+    return aarch64.planReplay(address, opcode);
+}
+
 extern fn demo_add_target(a: i32, b: i32) callconv(.c) i32;
 extern fn demo_mul_replacement(a: i32, b: i32) callconv(.c) i32;
 extern var demo_add_patchpoint: u8;
+extern fn demo_adr_target() callconv(.c) u64;
+extern var demo_adr_patchpoint: u8;
+extern var demo_adr_expected: u8;
+extern fn demo_adrp_target() callconv(.c) u64;
+extern var demo_adrp_patchpoint: u8;
+extern var demo_adrp_data: u8;
+extern fn demo_ldr_x_literal_target() callconv(.c) u64;
+extern var demo_ldr_x_literal_patchpoint: u8;
+extern fn demo_ldr_w_literal_target() callconv(.c) u32;
+extern var demo_ldr_w_literal_patchpoint: u8;
+extern fn demo_ldr_s_literal_target(out: [*]u8) callconv(.c) void;
+extern var demo_ldr_s_literal_patchpoint: u8;
+extern fn demo_ldr_d_literal_target(out: [*]u8) callconv(.c) void;
+extern var demo_ldr_d_literal_patchpoint: u8;
+extern fn demo_ldr_q_literal_target(out: [*]u8) callconv(.c) void;
+extern var demo_ldr_q_literal_patchpoint: u8;
+extern fn demo_ldrsw_literal_target() callconv(.c) i64;
+extern var demo_ldrsw_literal_patchpoint: u8;
+extern fn demo_bl_target() callconv(.c) i32;
+extern var demo_bl_patchpoint: u8;
+extern fn demo_b_eq_target(a: i32, b: i32) callconv(.c) i32;
+extern var demo_b_eq_patchpoint: u8;
+extern fn demo_cbz_target(a: u64) callconv(.c) i32;
+extern var demo_cbz_patchpoint: u8;
+extern fn demo_tbz_target(a: u64) callconv(.c) i32;
+extern var demo_tbz_patchpoint: u8;
+extern fn demo_fp_context_target(out: [*]u8) callconv(.c) void;
+extern var demo_fp_context_patchpoint: u8;
 
 fn signalReturn42(_: u64, ctx: *HookContext) callconv(.c) void {
     ctx.regs.named.x0 = 42;
@@ -320,6 +370,21 @@ fn signalReturn99(_: u64, ctx: *HookContext) callconv(.c) void {
 fn signalPrepare42(_: u64, ctx: *HookContext) callconv(.c) void {
     ctx.regs.named.x0 = 40;
     ctx.regs.named.x1 = 2;
+}
+
+fn signalNoop(_: u64, _: *HookContext) callconv(.c) void {}
+
+const callback_q0_pattern: u128 =
+    (@as(u128, 0x1122_3344_5566_7788) << 64) | 0x99AA_BBCC_DDEE_FF00;
+const literal_q_pattern: u128 =
+    (@as(u128, 0x0F1E_2D3C_4B5A_6978) << 64) | 0x8877_6655_4433_2211;
+
+fn signalWriteQ0Pattern(_: u64, ctx: *HookContext) callconv(.c) void {
+    ctx.fpregs.v[0] = callback_q0_pattern;
+}
+
+fn readVectorBits(bytes: []const u8) u128 {
+    return std.mem.readInt(u128, bytes[0..16], .little);
 }
 
 test "patchcode detours and unhook restores" {
@@ -435,6 +500,221 @@ test "instrument_no_original skips the trapped instruction" {
     restored = true;
 
     try std.testing.expectEqual(@as(i32, 7), demo_add_target(3, 4));
+}
+
+test "instrument_no_original writes back callback-edited q0 state" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_fp_context_patchpoint);
+    var out: [16]u8 = [_]u8{0} ** 16;
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument_no_original(patchpoint_addr, signalWriteQ0Pattern);
+    demo_fp_context_target(out[0..].ptr);
+    try std.testing.expectEqual(callback_q0_pattern, readVectorBits(out[0..]));
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays adr at the original PC" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_adr_patchpoint);
+    const expected_addr: u64 = @intFromPtr(&demo_adr_expected);
+
+    try std.testing.expectEqual(expected_addr, demo_adr_target());
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    try std.testing.expectEqual(expected_addr, demo_adr_target());
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays adrp at the original PC" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_adrp_patchpoint);
+    const expected_page = @intFromPtr(&demo_adrp_data) & ~@as(u64, 0xFFF);
+
+    try std.testing.expectEqual(expected_page, demo_adrp_target());
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    try std.testing.expectEqual(expected_page, demo_adrp_target());
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays ldr literal into x register" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_ldr_x_literal_patchpoint);
+
+    try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), demo_ldr_x_literal_target());
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), demo_ldr_x_literal_target());
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays ldr literal into w register" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_ldr_w_literal_patchpoint);
+
+    try std.testing.expectEqual(@as(u32, 0x89AB_CDEF), demo_ldr_w_literal_target());
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    try std.testing.expectEqual(@as(u32, 0x89AB_CDEF), demo_ldr_w_literal_target());
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays ldr literal into s register and clears upper q bits" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_ldr_s_literal_patchpoint);
+    var out: [16]u8 = [_]u8{0} ** 16;
+
+    demo_ldr_s_literal_target(out[0..].ptr);
+    try std.testing.expectEqual(@as(u128, 0x3F80_0000), readVectorBits(out[0..]));
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    out = [_]u8{0} ** 16;
+    demo_ldr_s_literal_target(out[0..].ptr);
+    try std.testing.expectEqual(@as(u128, 0x3F80_0000), readVectorBits(out[0..]));
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays ldr literal into d register and clears upper q bits" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_ldr_d_literal_patchpoint);
+    var out: [16]u8 = [_]u8{0} ** 16;
+
+    demo_ldr_d_literal_target(out[0..].ptr);
+    try std.testing.expectEqual(@as(u128, 0x4000_0000_0000_0000), readVectorBits(out[0..]));
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    out = [_]u8{0} ** 16;
+    demo_ldr_d_literal_target(out[0..].ptr);
+    try std.testing.expectEqual(@as(u128, 0x4000_0000_0000_0000), readVectorBits(out[0..]));
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays ldr literal into q register" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_ldr_q_literal_patchpoint);
+    var out: [16]u8 = [_]u8{0} ** 16;
+
+    demo_ldr_q_literal_target(out[0..].ptr);
+    try std.testing.expectEqual(literal_q_pattern, readVectorBits(out[0..]));
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    out = [_]u8{0} ** 16;
+    demo_ldr_q_literal_target(out[0..].ptr);
+    try std.testing.expectEqual(literal_q_pattern, readVectorBits(out[0..]));
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays ldrsw literal with sign extension" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_ldrsw_literal_patchpoint);
+
+    try std.testing.expectEqual(@as(i64, -128), demo_ldrsw_literal_target());
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    try std.testing.expectEqual(@as(i64, -128), demo_ldrsw_literal_target());
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays bl by branching at the original target" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_bl_patchpoint);
+
+    try std.testing.expectEqual(@as(i32, 77), demo_bl_target());
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    try std.testing.expectEqual(@as(i32, 77), demo_bl_target());
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays b.cond from live cpsr flags" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_b_eq_patchpoint);
+
+    try std.testing.expectEqual(@as(i32, 2), demo_b_eq_target(5, 5));
+    try std.testing.expectEqual(@as(i32, 1), demo_b_eq_target(5, 6));
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    try std.testing.expectEqual(@as(i32, 2), demo_b_eq_target(5, 5));
+    try std.testing.expectEqual(@as(i32, 1), demo_b_eq_target(5, 6));
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays cbz from live register state" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_cbz_patchpoint);
+
+    try std.testing.expectEqual(@as(i32, 4), demo_cbz_target(0));
+    try std.testing.expectEqual(@as(i32, 3), demo_cbz_target(9));
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    try std.testing.expectEqual(@as(i32, 4), demo_cbz_target(0));
+    try std.testing.expectEqual(@as(i32, 3), demo_cbz_target(9));
+
+    try unhook(patchpoint_addr);
+    restored = true;
+}
+
+test "instrument replays tbz from live register state" {
+    const patchpoint_addr: u64 = @intFromPtr(&demo_tbz_patchpoint);
+
+    try std.testing.expectEqual(@as(i32, 6), demo_tbz_target(0));
+    try std.testing.expectEqual(@as(i32, 5), demo_tbz_target(8));
+
+    var restored = false;
+    defer if (!restored) unhook(patchpoint_addr) catch {};
+
+    _ = try instrument(patchpoint_addr, signalNoop);
+    try std.testing.expectEqual(@as(i32, 6), demo_tbz_target(0));
+    try std.testing.expectEqual(@as(i32, 5), demo_tbz_target(8));
+
+    try unhook(patchpoint_addr);
+    restored = true;
 }
 
 test "prepatched inline_hook unregisters runtime state without restoring text" {

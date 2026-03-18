@@ -32,6 +32,14 @@ pub const HookError = error{
     /// A near branch encoding cannot reach the requested destination.
     BranchOutOfRange,
 
+    /// `instrument(...)` was asked to execute the original instruction, but the
+    /// current backend could not prove a safe replay strategy for that opcode.
+    ReplayUnsupported,
+
+    /// The trapped instruction would require floating-point / SIMD state that a
+    /// given backend or installation mode does not currently remap.
+    FloatingPointContextUnavailable,
+
     /// Changing page protections for executable memory failed.
     PageProtectionChangeFailed,
 
