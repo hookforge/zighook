@@ -19,15 +19,7 @@ jobs:
           version: 0.15.2
 
       - name: Zig fmt
-        run: |
-          zig fmt --check \
-            build.zig \
-            src/*.zig \
-            src/arch/*.zig \
-            src/platform/*.zig \
-            examples/*/main.zig \
-            examples/support/*.zig \
-            examples/preload/*.zig
+        run: zig fmt --check $(git ls-files '*.zig')
 
       - name: Zig build
         run: zig build
@@ -35,8 +27,68 @@ jobs:
       - name: Zig test
         run: zig build test
 
-      - name: Build examples
-        run: zig build examples
+      - name: Example inline_hook_signal
+        working-directory: examples/inline_hook_signal
+        run: |
+          set -euo pipefail
+          cc -arch arm64 -O3 -DNDEBUG -Wl,-export_dynamic -o target target.c
+          zig build-lib -dynamic -OReleaseFast -femit-bin=hook.dylib \
+            --dep zighook \
+            -Mroot=hook.zig \
+            -Mzighook=../../src/root.zig \
+            -lc
+          output="$(DYLD_INSERT_LIBRARIES="$PWD/hook.dylib" ./target)"
+          test "$output" = "result=42"
 
-      - name: Run preload smoke tests
-        run: zig build preload-smoke
+      - name: Example instrument_with_original
+        working-directory: examples/instrument_with_original
+        run: |
+          set -euo pipefail
+          cc -arch arm64 -O3 -DNDEBUG -Wl,-export_dynamic -o target target.c
+          zig build-lib -dynamic -OReleaseFast -femit-bin=hook.dylib \
+            --dep zighook \
+            -Mroot=hook.zig \
+            -Mzighook=../../src/root.zig \
+            -lc
+          output="$(DYLD_INSERT_LIBRARIES="$PWD/hook.dylib" ./target)"
+          test "$output" = "result=42"
+
+      - name: Example instrument_no_original
+        working-directory: examples/instrument_no_original
+        run: |
+          set -euo pipefail
+          cc -arch arm64 -O3 -DNDEBUG -Wl,-export_dynamic -o target target.c
+          zig build-lib -dynamic -OReleaseFast -femit-bin=hook.dylib \
+            --dep zighook \
+            -Mroot=hook.zig \
+            -Mzighook=../../src/root.zig \
+            -lc
+          output="$(DYLD_INSERT_LIBRARIES="$PWD/hook.dylib" ./target)"
+          test "$output" = "result=99"
+
+      - name: Example instrument_unhook_restore
+        working-directory: examples/instrument_unhook_restore
+        run: |
+          set -euo pipefail
+          cc -arch arm64 -O3 -DNDEBUG -Wl,-export_dynamic -o target target.c
+          zig build-lib -dynamic -OReleaseFast -femit-bin=hook.dylib \
+            --dep zighook \
+            -Mroot=hook.zig \
+            -Mzighook=../../src/root.zig \
+            -lc
+          output="$(DYLD_INSERT_LIBRARIES="$PWD/hook.dylib" ./target)"
+          expected=$'hooked=123\nrestored=5'
+          test "$output" = "$expected"
+
+      - name: Example prepatched_inline_hook
+        working-directory: examples/prepatched_inline_hook
+        run: |
+          set -euo pipefail
+          cc -arch arm64 -O3 -DNDEBUG -Wl,-export_dynamic -o target target.c
+          zig build-lib -dynamic -OReleaseFast -femit-bin=hook.dylib \
+            --dep zighook \
+            -Mroot=hook.zig \
+            -Mzighook=../../src/root.zig \
+            -lc
+          output="$(DYLD_INSERT_LIBRARIES="$PWD/hook.dylib" ./target)"
+          test "$output" = "result=77"

@@ -9,12 +9,9 @@ Current scope:
 
 Implemented APIs:
 
-- `patchcode(address, opcode)`
-- `patch_bytes(allocator, address, bytes)`
 - `instrument(address, callback)`
 - `instrument_no_original(address, callback)`
 - `inline_hook(address, callback)`
-- `inline_hook_jump(address, replace_fn)`
 - `unhook(address)`
 - `original_opcode(address)`
 - `prepatched.instrument*`
@@ -23,12 +20,10 @@ Implemented APIs:
 
 The current backend supports:
 
-- direct instruction patching
 - trap-based instrumentation via `brk`
 - signal-based entry hooks
-- jump detours
 - strict execute-original replay for common AArch64 PC-relative instructions
-- public callback access to AArch64 FP/SIMD state (`v0..v31`, `fpsr`, `fpcr`)
+- public callback access to AArch64 FP/SIMD state (`fpregs.v[i]`, `fpregs.named.v0..v31`, `fpsr`, `fpcr`)
 - constructor-based dylib payloads for `DYLD_INSERT_LIBRARIES` / later Mach-O insertion workflows
 
 ## Status
@@ -64,43 +59,62 @@ falling back to unsafe trampoline replay.
 ```bash
 zig build
 zig build test
-zig build examples
 ```
 
-## Preload Smoke Tests
+`build.zig` intentionally builds only the library and the test suite.
+Examples are not wired into the root build because each example directory is
+treated as a standalone mini-project with its own:
 
-The repository includes dylib payloads and a small C target to validate constructor-based preload hooking:
+- `README.md`
+- `target.c`
+- `hook.zig`
 
-```bash
-zig build preload-smoke
-```
-
-This builds and runs:
-
-- `libzighook_payload_inline_hook_signal.dylib`
-- `libzighook_payload_inline_hook_jump.dylib`
-- `zighook_preload_target_add`
-
-Manual preload usage after `zig build`:
-
-```bash
-DYLD_INSERT_LIBRARIES=zig-out/lib/libzighook_payload_inline_hook_signal.dylib \
-TARGET_EXPECT=42 \
-zig-out/bin/zighook_preload_target_add
-```
-
-```bash
-DYLD_INSERT_LIBRARIES=zig-out/lib/libzighook_payload_inline_hook_jump.dylib \
-TARGET_EXPECT=6 \
-zig-out/bin/zighook_preload_target_add
-```
+As a library package, the repository also intentionally has no `src/main.zig`.
 
 ## Examples
+
+Every example is built directly from inside its own directory with plain shell
+commands. This keeps the example layout easy to read, keeps the injected hook
+library self-contained, and avoids hiding the real build steps behind root
+`build.zig` glue.
+
+Common pattern:
+
+```bash
+cd examples/inline_hook_signal
+
+cc -arch arm64 -O3 -DNDEBUG -Wl,-export_dynamic -o target target.c
+
+zig build-lib -dynamic -OReleaseFast -femit-bin=hook.dylib \
+  --dep zighook \
+  -Mroot=hook.zig \
+  -Mzighook=../../src/root.zig \
+  -lc
+
+DYLD_INSERT_LIBRARIES=$PWD/hook.dylib ./target
+```
+
+Available examples:
+
+- `inline_hook_signal`: function-entry trap hook, expected output `result=42`
+- `instrument_with_original`: trap one instruction and replay it, expected output `result=42`
+- `instrument_no_original`: trap one instruction and replace it, expected output `result=99`
+- `instrument_unhook_restore`: install, unhook, and verify restoration, expected output `hooked=123` then `restored=5`
+- `prepatched_inline_hook`: register a trap point that already contains `brk`, expected output `result=77`
+
+CI runs these exact per-directory build commands and compares exact stdout.
 
 See:
 
 - `examples/README.md`
-- `examples/preload/README.md`
+- each `examples/*/README.md`
+
+## Public API Docs
+
+The public integration guide lives directly in `src/root.zig`. Each exported
+function is documented with behavior, installation rules, resume semantics, and
+small code examples so callers can integrate the library without reading
+internal backend code.
 
 ## License
 

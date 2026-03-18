@@ -8,4 +8,6 @@ root_test_bin
 *.so
 *.dylib.dSYM/
 *.exe
+examples/*/hook.dylib
+examples/*/target
 .DS_Store

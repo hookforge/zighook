@@ -20,17 +20,11 @@ pub const HookError = error{
     /// implemented backend or by the selected installation mode.
     UnsupportedOperation,
 
-    /// The fixed-size direct patch registry is full.
-    PatchSlotsFull,
-
     /// The fixed-size instrumentation registry is full.
     HookSlotsFull,
 
     /// No runtime patch or hook state exists for the specified address.
     HookNotFound,
-
-    /// A near branch encoding cannot reach the requested destination.
-    BranchOutOfRange,
 
     /// `instrument(...)` was asked to execute the original instruction, but the
     /// current backend could not prove a safe replay strategy for that opcode.

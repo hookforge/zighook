@@ -13,7 +13,6 @@ const std = @import("std");
 
 const HookError = @import("error.zig").HookError;
 const aarch64 = @import("arch/aarch64.zig");
-const context = @import("context.zig");
 const state = @import("state.zig");
 const memory = @import("memory.zig");
 
@@ -86,7 +85,7 @@ fn chainPrevious(signum: c_int, info: *const std.c.siginfo_t, uctx: ?*anyopaque)
 /// - otherwise `inline_hook` returns to `lr`
 /// - otherwise `instrument` uses the precomputed replay plan
 /// - otherwise `instrument_no_original` skips to the next instruction
-fn handleTrapAarch64(address: u64, ctx: *context.HookContext) bool {
+fn handleTrapAarch64(address: u64, ctx: *aarch64.HookContext) bool {
     const slot = state.slotByAddress(address) orelse return false;
     const callback = slot.callback orelse return false;
 
@@ -132,14 +131,14 @@ fn trapHandler(signum: c_int, info: *const std.c.siginfo_t, uctx_opaque: ?*anyop
     // used by `std.debug` and treat the outer frame as byte-aligned.
     const uctx: *align(1) std.c.ucontext_t = @ptrCast(uctx_opaque.?);
     const mcontext = uctx.mcontext;
-    var ctx = context.captureMachineContext(mcontext);
+    var ctx = aarch64.captureMachineContext(mcontext);
     const trap_address = ctx.pc;
 
     const opcode = memory.readU32(trap_address) catch {
         chainPrevious(signum, info, uctx_opaque);
         return;
     };
-    if (!memory.isBrk(opcode)) {
+    if (!aarch64.isBrk(opcode)) {
         chainPrevious(signum, info, uctx_opaque);
         return;
     }
@@ -149,7 +148,7 @@ fn trapHandler(signum: c_int, info: *const std.c.siginfo_t, uctx_opaque: ?*anyop
         return;
     }
 
-    context.writeBackMachineContext(mcontext, &ctx);
+    aarch64.writeBackMachineContext(mcontext, &ctx);
 }
 
 fn installSignal(signum: c_int) HookError!void {

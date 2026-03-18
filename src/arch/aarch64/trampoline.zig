@@ -8,9 +8,9 @@
 
 const std = @import("std");
 
-const HookError = @import("error.zig").HookError;
+const HookError = @import("../../error.zig").HookError;
 const constants = @import("constants.zig");
-const memory = @import("memory.zig");
+const memory = @import("../../memory.zig");
 
 /// Allocates an RX trampoline that replays `original_bytes` and continues at
 /// `address + step_len`.

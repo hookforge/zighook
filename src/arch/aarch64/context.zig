@@ -1,12 +1,18 @@
-//! Public register context layout exposed to hook callbacks.
+//! Public AArch64 callback context and Darwin machine-context remapping.
 //!
-//! The Zig rewrite keeps this layout intentionally close to the Rust crate:
-//! - `regs.x[i]` gives indexed access to x0..x30
-//! - `regs.named.x0 ... x30` gives named access to the same registers
-//! - `sp`, `pc`, and `cpsr` expose the architectural integer control state
-//! - `fpregs.v[i]` exposes the raw 128-bit bits of `v0..v31`
-//! - `fpregs.fpsr` / `fpregs.fpcr` expose the floating-point status/control
-//!   registers
+//! This module is intentionally architecture-scoped instead of living at the
+//! top level because both the register layout and the Darwin `mcontext_t`
+//! mapping are tightly coupled to the AArch64 backend.
+//!
+//! The public callback ABI offers dual register views:
+//! - `regs.x[i]` / `regs.named.x0 ... x30`
+//! - `fpregs.v[i]` / `fpregs.named.v0 ... v31`
+//!
+//! The floating-point register bank stores the full 128-bit architectural
+//! `vN` state. Callback code may reinterpret the low lanes as needed:
+//! - low 32 bits: `sN`
+//! - low 64 bits: `dN`
+//! - full 128 bits: `qN`
 //!
 //! Darwin splits this information across two machine-context payloads:
 //! - `mcontext.ss` for general-purpose state
@@ -65,19 +71,55 @@ pub const XRegisters = extern union {
     named: XRegistersNamed,
 };
 
-/// Raw AArch64 SIMD / floating-point register bank.
+/// Named 128-bit SIMD / floating-point register view.
 ///
-/// Each `v[i]` element stores the architectural 128-bit `vN` register bits.
-/// Callback code can reinterpret the low lanes as needed:
-/// - low 32 bits: `sN`
-/// - low 64 bits: `dN`
-/// - full 128 bits: `qN`
-pub const FpRegisters = extern struct {
-    /// Raw bits of `v0..v31`.
+/// The field names follow the architectural `vN` register bank because the
+/// stored value is always the full 128-bit register contents.
+pub const FpRegistersNamed = extern struct {
+    v0: u128,
+    v1: u128,
+    v2: u128,
+    v3: u128,
+    v4: u128,
+    v5: u128,
+    v6: u128,
+    v7: u128,
+    v8: u128,
+    v9: u128,
+    v10: u128,
+    v11: u128,
+    v12: u128,
+    v13: u128,
+    v14: u128,
+    v15: u128,
+    v16: u128,
+    v17: u128,
+    v18: u128,
+    v19: u128,
+    v20: u128,
+    v21: u128,
+    v22: u128,
+    v23: u128,
+    v24: u128,
+    v25: u128,
+    v26: u128,
+    v27: u128,
+    v28: u128,
+    v29: u128,
+    v30: u128,
+    v31: u128,
+};
+
+/// Dual view over the 32 AArch64 SIMD / floating-point registers.
+pub const FpRegisters = extern union {
     v: [32]u128,
-    /// Floating-point status register.
+    named: FpRegistersNamed,
+};
+
+/// ABI-equivalent view of the Darwin NEON payload used for layout checks.
+const FpStateLayout = extern struct {
+    fpregs: FpRegisters,
     fpsr: u32,
-    /// Floating-point control register.
     fpcr: u32,
 };
 
@@ -93,18 +135,25 @@ pub const HookContext = extern struct {
     cpsr: u32,
     /// Padding required by the Darwin thread-state ABI.
     pad: u32,
-    /// Raw SIMD / floating-point state (`v0..v31`, `fpsr`, `fpcr`).
+    /// Raw SIMD / floating-point register bank (`v0..v31`).
     fpregs: FpRegisters,
+    /// Floating-point status register.
+    fpsr: u32,
+    /// Floating-point control register.
+    fpcr: u32,
 };
 
 // Keep the public callback layout aligned with the amount of state Darwin
 // exposes through `ss + ns`, even though we copy it explicitly.
 comptime {
     std.debug.assert(@sizeOf(XRegisters) == @sizeOf([31]u64));
-    std.debug.assert(@sizeOf(FpRegisters) == @sizeOf(DarwinNeonState));
-    std.debug.assert(@alignOf(FpRegisters) == @alignOf(DarwinNeonState));
-    std.debug.assert(@sizeOf(HookContext) == @sizeOf(DarwinThreadState) + @sizeOf(DarwinNeonState));
+    std.debug.assert(@sizeOf(FpRegisters) == @sizeOf([32]u128));
+    std.debug.assert(@alignOf(FpRegisters) == @alignOf([32]u128));
+    std.debug.assert(@sizeOf(FpRegistersNamed) == @sizeOf([32]u128));
+    std.debug.assert(@sizeOf(FpStateLayout) == @sizeOf(DarwinNeonState));
+    std.debug.assert(@alignOf(FpStateLayout) == @alignOf(DarwinNeonState));
     std.debug.assert(@alignOf(HookContext) == @alignOf(FpRegisters));
+    std.debug.assert(@sizeOf(HookContext) == @sizeOf(DarwinThreadState) + @sizeOf(DarwinNeonState));
 }
 
 /// C-callable callback type used by all runtime hook entry points.
@@ -127,8 +176,8 @@ pub fn captureMachineContext(mcontext: *const std.c.mcontext_t) HookContext {
     ctx.pad = mcontext.ss.__pad;
 
     @memcpy(ctx.fpregs.v[0..], mcontext.ns.q[0..]);
-    ctx.fpregs.fpsr = mcontext.ns.fpsr;
-    ctx.fpregs.fpcr = mcontext.ns.fpcr;
+    ctx.fpsr = mcontext.ns.fpsr;
+    ctx.fpcr = mcontext.ns.fpcr;
     return ctx;
 }
 
@@ -146,8 +195,8 @@ pub fn writeBackMachineContext(mcontext: *std.c.mcontext_t, ctx: *const HookCont
     mcontext.ss.__pad = ctx.pad;
 
     @memcpy(mcontext.ns.q[0..], ctx.fpregs.v[0..]);
-    mcontext.ns.fpsr = ctx.fpregs.fpsr;
-    mcontext.ns.fpcr = ctx.fpregs.fpcr;
+    mcontext.ns.fpsr = ctx.fpsr;
+    mcontext.ns.fpcr = ctx.fpcr;
 }
 
 test "Darwin machine context remap round-trips integer and FP state" {
@@ -180,8 +229,9 @@ test "Darwin machine context remap round-trips integer and FP state" {
     try std.testing.expectEqual(@as(u32, 0x6000), ctx.cpsr);
     try std.testing.expectEqual(@as(u32, 0x7000), ctx.pad);
     try std.testing.expectEqual((@as(u128, 31) << 64) | 0xBF, ctx.fpregs.v[31]);
-    try std.testing.expectEqual(@as(u32, 0x8000), ctx.fpregs.fpsr);
-    try std.testing.expectEqual(@as(u32, 0x9000), ctx.fpregs.fpcr);
+    try std.testing.expectEqual((@as(u128, 31) << 64) | 0xBF, ctx.fpregs.named.v31);
+    try std.testing.expectEqual(@as(u32, 0x8000), ctx.fpsr);
+    try std.testing.expectEqual(@as(u32, 0x9000), ctx.fpcr);
 
     ctx.regs.x[0] = 0xDEAD;
     ctx.regs.x[29] = 0xBEEF;
@@ -190,10 +240,10 @@ test "Darwin machine context remap round-trips integer and FP state" {
     ctx.pc = 0x2222;
     ctx.cpsr = 0x3333;
     ctx.pad = 0x4444;
-    ctx.fpregs.v[0] = 0x1122_3344_5566_7788;
-    ctx.fpregs.v[31] = (@as(u128, 0x9999_AAAA_BBBB_CCCC) << 64) | 0xDDDD_EEEE_FFFF_0000;
-    ctx.fpregs.fpsr = 0x5555;
-    ctx.fpregs.fpcr = 0x6666;
+    ctx.fpregs.named.v0 = 0x1122_3344_5566_7788;
+    ctx.fpregs.named.v31 = (@as(u128, 0x9999_AAAA_BBBB_CCCC) << 64) | 0xDDDD_EEEE_FFFF_0000;
+    ctx.fpsr = 0x5555;
+    ctx.fpcr = 0x6666;
 
     writeBackMachineContext(&mcontext, &ctx);
 

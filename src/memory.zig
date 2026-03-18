@@ -4,7 +4,6 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const HookError = @import("error.zig").HookError;
-const constants = @import("constants.zig");
 
 /// Reads arbitrary bytes from the current process image.
 ///
@@ -23,19 +22,6 @@ pub fn readU32(address: u64) HookError!u32 {
 
     const ptr: *const u32 = @ptrFromInt(@as(usize, @intCast(address)));
     return std.mem.littleToNative(u32, ptr.*);
-}
-
-/// Returns whether the 32-bit word encodes a `brk` instruction.
-pub fn isBrk(opcode: u32) bool {
-    return (opcode & constants.brk_mask) == (constants.brk_opcode & constants.brk_mask);
-}
-
-/// Returns the width of the instruction that starts at `address`.
-///
-/// The current backend only supports AArch64, so the answer is always 4 bytes.
-pub fn instructionWidth(address: u64) HookError!u8 {
-    if (address == 0 or (address & 0b11) != 0) return error.InvalidAddress;
-    return 4;
 }
 
 /// Writes a 32-bit instruction word and returns the overwritten instruction.

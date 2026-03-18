@@ -14,16 +14,6 @@ const std = @import("std");
 const HookError = @import("error.zig").HookError;
 const constants = @import("constants.zig");
 const aarch64 = @import("arch/aarch64.zig");
-const context = @import("context.zig");
-const trampoline = @import("trampoline.zig");
-
-const allocator = std.heap.c_allocator;
-
-/// Owned direct-patch record returned when a patch slot is removed.
-pub const OwnedPatch = struct {
-    address: u64,
-    original: []u8,
-};
 
 /// Instrumentation slot used by trap-based APIs.
 pub const HookSlot = struct {
@@ -38,7 +28,7 @@ pub const HookSlot = struct {
     /// Width of the trapped instruction in bytes.
     step_len: u8 = 0,
     /// User callback invoked when the trap fires.
-    callback: ?context.InstrumentCallback = null,
+    callback: ?aarch64.InstrumentCallback = null,
     /// Whether execution should replay the original instruction.
     execute_original: bool = false,
     /// Whether the callback should return directly to the caller when it leaves
@@ -52,12 +42,6 @@ pub const HookSlot = struct {
     trampoline_pc: u64 = 0,
 };
 
-const PatchSlot = struct {
-    used: bool = false,
-    address: u64 = 0,
-    original: []u8 = &.{},
-};
-
 const OriginalOpcodeSlot = struct {
     used: bool = false,
     address: u64 = 0,
@@ -65,23 +49,8 @@ const OriginalOpcodeSlot = struct {
 };
 
 var hook_slots: [constants.max_hooks]HookSlot = [_]HookSlot{.{}} ** constants.max_hooks;
-var patch_slots: [constants.max_hooks]PatchSlot = [_]PatchSlot{.{}} ** constants.max_hooks;
 var original_opcode_slots: [constants.max_hooks]OriginalOpcodeSlot = [_]OriginalOpcodeSlot{.{}} ** constants.max_hooks;
 var original_opcode_replace_index: usize = 0;
-
-fn findPatchIndex(address: u64) ?usize {
-    for (patch_slots, 0..) |slot, index| {
-        if (slot.used and slot.address == address) return index;
-    }
-    return null;
-}
-
-fn findFreePatchIndex() ?usize {
-    for (patch_slots, 0..) |slot, index| {
-        if (!slot.used) return index;
-    }
-    return null;
-}
 
 fn findHookIndex(address: u64) ?usize {
     for (hook_slots, 0..) |slot, index| {
@@ -104,57 +73,6 @@ fn findOriginalOpcodeIndex(address: u64) ?usize {
     return null;
 }
 
-/// Stores original bytes for a direct patch API (`patchcode`, `patch_bytes`,
-/// `inline_hook_jump`).
-pub fn rememberPatch(address: u64, original: []const u8) HookError!bool {
-    if (address == 0 or original.len == 0) return error.InvalidAddress;
-    if (findPatchIndex(address) != null) return false;
-
-    const free_index = findFreePatchIndex() orelse return error.PatchSlotsFull;
-    const stored = try allocator.alloc(u8, original.len);
-    @memcpy(stored, original);
-
-    patch_slots[free_index] = .{
-        .used = true,
-        .address = address,
-        .original = stored,
-    };
-    return true;
-}
-
-/// Removes a direct patch slot without restoring code.
-pub fn discardPatch(address: u64) void {
-    if (findPatchIndex(address)) |index| {
-        allocator.free(patch_slots[index].original);
-        patch_slots[index] = .{};
-    }
-}
-
-/// Takes ownership of a direct patch slot.
-pub fn takePatch(address: u64) ?OwnedPatch {
-    const index = findPatchIndex(address) orelse return null;
-    const slot = patch_slots[index];
-    patch_slots[index] = .{};
-
-    return .{
-        .address = slot.address,
-        .original = slot.original,
-    };
-}
-
-/// Frees a patch record previously returned by `takePatch`.
-pub fn freeTakenPatch(patch: OwnedPatch) void {
-    allocator.free(patch.original);
-}
-
-/// Returns the current direct patch opcode, if known.
-pub fn patchOriginalOpcode(address: u64) ?u32 {
-    const index = findPatchIndex(address) orelse return null;
-    const slot = patch_slots[index];
-    if (slot.original.len < 4) return null;
-    return std.mem.readInt(u32, slot.original[0..4], .little);
-}
-
 /// Registers or updates a trap-based hook slot.
 ///
 /// Re-registering the same address is allowed. As in the Rust crate, the most
@@ -165,7 +83,7 @@ pub fn registerHook(
     address: u64,
     original_bytes: []const u8,
     step_len: u8,
-    callback: context.InstrumentCallback,
+    callback: aarch64.InstrumentCallback,
     execute_original: bool,
     return_to_caller: bool,
     runtime_patch_installed: bool,
@@ -195,7 +113,7 @@ pub fn registerHook(
         if (execute_original and replay_plan.requiresTrampoline() and slot.trampoline_pc == 0) {
             // Trampolines are allocated lazily so `inline_hook(...)` and
             // `instrument_no_original(...)` do not pay RX memory overhead.
-            slot.trampoline_pc = try trampoline.createOriginalTrampoline(
+            slot.trampoline_pc = try aarch64.createOriginalTrampoline(
                 address,
                 slot.original_bytes[0..slot.original_len],
                 slot.step_len,
@@ -208,7 +126,7 @@ pub fn registerHook(
 
     const free_index = findFreeHookIndex() orelse return error.HookSlotsFull;
     const trampoline_pc = if (execute_original and replay_plan.requiresTrampoline())
-        try trampoline.createOriginalTrampoline(address, original_bytes, step_len)
+        try aarch64.createOriginalTrampoline(address, original_bytes, step_len)
     else
         0;
 

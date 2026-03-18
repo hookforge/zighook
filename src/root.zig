@@ -1,15 +1,20 @@
-//! zighook: experimental runtime patching and trap-based instrumentation.
+//! Public zighook API.
 //!
-//! This rewrite currently implements the first backend slice:
+//! `zighook` is an experimental runtime instrumentation library for the first
+//! completed backend slice:
 //! - OS: macOS
 //! - Architecture: AArch64 / Apple Silicon
 //!
-//! The design intentionally stays close to the original Rust crate:
-//! - direct code patching
-//! - trap-based instrumentation via `brk`
-//! - signal-based function entry hooks
-//! - jump detours
-//! - fixed-size runtime registries
+//! The caller-facing design is intentionally small and entirely centered around
+//! `sigaction`-driven trap handling:
+//! - `instrument(...)`: trap one instruction and then execute it
+//! - `instrument_no_original(...)`: trap one instruction and replace it
+//! - `inline_hook(...)`: trap a function entry and return directly to the caller
+//! - `prepatched.*`: the same semantics for binaries that already contain `brk`
+//!
+//! This file is meant to be the primary integration guide. Application code
+//! should normally not need to read the internal backend modules in order to
+//! install and use hooks correctly.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -20,20 +25,60 @@ comptime {
     }
 }
 
-const constants = @import("constants.zig");
-const aarch64 = @import("arch/aarch64.zig");
-const context = @import("context.zig");
-const state = @import("state.zig");
 const memory = @import("memory.zig");
 const signal = @import("signal.zig");
-const trampoline = @import("trampoline.zig");
+const state = @import("state.zig");
+const aarch64 = @import("arch/aarch64.zig");
 
+/// Public error set returned by hook installation, lookup, and removal APIs.
+///
+/// In practice, most callers should expect a small subset of failures:
+/// - `error.InvalidAddress`: null, misaligned, or otherwise unusable address
+/// - `error.ReplayUnsupported`: execute-original replay is not safe for that opcode
+/// - `error.HookSlotsFull`: the fixed-size runtime registry has no free entry
+/// - `error.HookNotFound`: `unhook(...)` was asked to remove an unknown address
+/// - `error.UnsupportedOperation`: usually means a prepatched workflow is
+///   missing cached original opcode metadata
 pub const HookError = @import("error.zig").HookError;
-pub const HookContext = context.HookContext;
-pub const InstrumentCallback = context.InstrumentCallback;
-pub const XRegisters = context.XRegisters;
-pub const XRegistersNamed = context.XRegistersNamed;
-pub const FpRegisters = context.FpRegisters;
+
+/// Stable AArch64 register snapshot exposed to every callback.
+///
+/// The general-purpose register bank offers two equivalent views:
+/// - `ctx.regs.x[0] ... ctx.regs.x[30]`
+/// - `ctx.regs.named.x0 ... ctx.regs.named.x30`
+///
+/// The SIMD / floating-point bank follows the architectural `vN` names and is
+/// also exposed as both indexed and named unions:
+/// - `ctx.fpregs.v[0] ... ctx.fpregs.v[31]`
+/// - `ctx.fpregs.named.v0 ... ctx.fpregs.named.v31`
+///
+/// The stored value is always the full 128-bit `vN` register contents. When a
+/// callback wants to emulate `sN` or `dN`, it typically writes the low 32 or
+/// low 64 bits of the corresponding `vN`.
+pub const HookContext = aarch64.HookContext;
+
+/// C-callable callback type used by all public hook installers.
+///
+/// Parameters:
+/// - `address`: the trapped instruction address
+/// - `ctx`: mutable live register state that will be written back on success
+///
+/// Control-flow rule:
+/// - if the callback overwrites `ctx.pc`, zighook respects that decision
+/// - otherwise the selected API decides how execution resumes
+pub const InstrumentCallback = aarch64.InstrumentCallback;
+
+/// Dual-view container for AArch64 general-purpose registers `x0..x30`.
+pub const XRegisters = aarch64.XRegisters;
+
+/// Named AArch64 general-purpose register view (`x0..x30`).
+pub const XRegistersNamed = aarch64.XRegistersNamed;
+
+/// Dual-view container for AArch64 SIMD / floating-point registers `v0..v31`.
+pub const FpRegisters = aarch64.FpRegisters;
+
+/// Named AArch64 SIMD / floating-point register view (`v0..v31`).
+pub const FpRegistersNamed = aarch64.FpRegistersNamed;
 
 /// How a trap-based API discovers the original instruction bytes it should
 /// remember and, optionally, replay.
@@ -44,121 +89,149 @@ const InstallMode = enum {
     prepatched,
 };
 
-/// Replaces one 32-bit instruction and returns the previous instruction word.
+/// Installs a trap on the instruction at `address` and replays the displaced
+/// instruction after `callback` returns.
 ///
-/// This API is ideal when:
-/// - the patch fits in a single AArch64 instruction
-/// - the caller already knows the exact opcode encoding
+/// This is the API to use when the original instruction must still run, but
+/// you want to inspect or edit machine state immediately before that happens.
 ///
-/// The original instruction is cached internally so `unhook(address)` can
-/// restore the text page later and `original_opcode(address)` can report it.
-pub fn patchcode(address: u64, new_opcode: u32) HookError!u32 {
-    var original_bytes: [4]u8 = undefined;
-    try memory.readInto(address, original_bytes[0..]);
-
-    const inserted = try state.rememberPatch(address, original_bytes[0..]);
-    errdefer if (inserted) state.discardPatch(address);
-
-    _ = try memory.patchU32(address, new_opcode);
-
-    const saved_opcode = std.mem.readInt(u32, original_bytes[0..], .little);
-    state.cacheOriginalOpcode(address, saved_opcode);
-    return saved_opcode;
-}
-
-/// Replaces an arbitrary number of bytes and returns the overwritten bytes.
+/// Installation contract:
+/// - `address` must point to a 4-byte aligned AArch64 instruction
+/// - zighook replaces that instruction with `brk #0`
+/// - the original opcode is returned to the caller and cached internally
+/// - signal handlers are installed lazily on the first successful hook
 ///
-/// The returned slice is allocated with `allocator`; the caller owns it.
+/// Resume behavior:
+/// - if `callback` overwrites `ctx.pc`, that explicit control-flow choice wins
+/// - otherwise zighook replays the displaced instruction
+/// - after replay, execution continues at the following instruction
 ///
-/// Use this when the replacement does not fit in one instruction or when the
-/// patch bytes come from some external encoder / assembler. zighook still keeps
-/// its own restoration copy so `unhook(address)` remains available.
-pub fn patch_bytes(allocator: std.mem.Allocator, address: u64, bytes: []const u8) HookError![]u8 {
-    const original = try allocator.alloc(u8, bytes.len);
-    errdefer allocator.free(original);
-
-    try memory.readInto(address, original);
-
-    const inserted = try state.rememberPatch(address, original);
-    errdefer if (inserted) state.discardPatch(address);
-
-    try memory.patchBytes(address, bytes);
-
-    if (original.len >= 4) {
-        state.cacheOriginalOpcode(address, std.mem.readInt(u32, original[0..4], .little));
-    }
-    return original;
-}
-
-/// Installs a trap-based instrumentation callback and replays the original
-/// instruction through an internal trampoline before execution continues.
+/// Execute-original mode is intentionally strict. Installation fails before
+/// patching code unless zighook can prove a safe replay strategy for the
+/// trapped opcode.
 ///
-/// This is the closest equivalent to a "single-instruction probe":
-/// - your callback sees and may edit the live register context
-/// - if it leaves `ctx.pc` unchanged, zighook executes the trapped instruction
-/// - execution then resumes at the following instruction
+/// This function returns the original 32-bit instruction word.
 ///
-/// Execute-original mode is strict. At install time zighook either:
-/// - proves that the displaced opcode is trampoline-safe
-/// - recognizes a supported PC-relative opcode and installs an emulation plan
-/// - or returns a replay-related installation error before patching code
+/// Example:
+/// ```zig
+/// const zighook = @import("zighook");
+/// const c = @cImport({
+///     @cInclude("dlfcn.h");
+/// });
+///
+/// fn onAdd(_: u64, ctx: *zighook.HookContext) callconv(.c) void {
+///     ctx.regs.named.x0 = 40;
+///     ctx.regs.named.x1 = 2;
+/// }
+///
+/// fn install() void {
+///     const symbol = c.dlsym(c.RTLD_DEFAULT, "target_add_patchpoint");
+///     if (symbol != null) {
+///         _ = zighook.instrument(@intFromPtr(symbol.?), onAdd) catch {};
+///     }
+/// }
+/// ```
 pub fn instrument(address: u64, callback: InstrumentCallback) HookError!u32 {
     return instrumentInternal(address, callback, true, false, .runtime_patch);
 }
 
-/// Installs a trap-based instrumentation callback and skips the original
-/// instruction by default.
+/// Installs a trap on the instruction at `address` and skips the displaced
+/// instruction unless the callback explicitly redirects control flow.
 ///
-/// This is useful when the callback fully emulates or replaces the trapped
-/// instruction. If the callback explicitly changes `ctx.pc`, that manual choice
-/// still wins.
+/// This is the replacement-style API. Use it when the callback fully emulates
+/// the trapped instruction or wants to synthesize a different result.
+///
+/// Resume behavior:
+/// - if `callback` overwrites `ctx.pc`, that explicit control-flow choice wins
+/// - otherwise zighook advances to the next instruction without replaying the
+///   displaced opcode
+///
+/// This function still returns the original 32-bit instruction word, which can
+/// be useful for logging or for later offline patch preparation.
+///
+/// Example:
+/// ```zig
+/// const zighook = @import("zighook");
+/// const c = @cImport({
+///     @cInclude("dlfcn.h");
+/// });
+///
+/// fn onHit(_: u64, ctx: *zighook.HookContext) callconv(.c) void {
+///     ctx.regs.named.x0 = 99;
+/// }
+///
+/// fn install() void {
+///     const symbol = c.dlsym(c.RTLD_DEFAULT, "target_add_patchpoint");
+///     if (symbol != null) {
+///         _ = zighook.instrument_no_original(@intFromPtr(symbol.?), onHit) catch {};
+///     }
+/// }
+/// ```
 pub fn instrument_no_original(address: u64, callback: InstrumentCallback) HookError!u32 {
     return instrumentInternal(address, callback, false, false, .runtime_patch);
 }
 
-/// Hooks a function entry with a trap instruction and returns to the caller if
-/// the callback does not override `ctx.pc`.
+/// Hooks a function entry by replacing its first instruction with `brk #0`.
+///
+/// This is the "return directly from the callback" API. It is typically used
+/// at function entry points where the callback wants to produce a synthetic
+/// return value and skip the callee body entirely.
+///
+/// Resume behavior:
+/// - if `callback` overwrites `ctx.pc`, that explicit control-flow choice wins
+/// - otherwise zighook returns to `lr`, as if the function had completed
 ///
 /// Typical usage:
 /// - write the desired return value into `ctx.regs.named.x0`
-/// - optionally edit other registers for side effects
-/// - leave `ctx.pc` untouched so zighook returns to `lr`
+/// - optionally adjust other registers for side effects
+/// - leave `ctx.pc` untouched so zighook returns to the caller automatically
+///
+/// This function returns the original 32-bit instruction word that was replaced
+/// by the trap.
+///
+/// Example:
+/// ```zig
+/// const zighook = @import("zighook");
+/// const c = @cImport({
+///     @cInclude("dlfcn.h");
+/// });
+///
+/// fn onEnter(_: u64, ctx: *zighook.HookContext) callconv(.c) void {
+///     ctx.regs.named.x0 = 42;
+/// }
+///
+/// fn install() void {
+///     const symbol = c.dlsym(c.RTLD_DEFAULT, "target_add");
+///     if (symbol != null) {
+///         _ = zighook.inline_hook(@intFromPtr(symbol.?), onEnter) catch {};
+///     }
+/// }
+/// ```
 pub fn inline_hook(address: u64, callback: InstrumentCallback) HookError!u32 {
     return instrumentInternal(address, callback, false, true, .runtime_patch);
 }
 
-/// Installs a direct jump detour at `address`.
-///
-/// Strategy:
-/// - use a compact `b` instruction if possible
-/// - fall back to an absolute literal-based jump sequence when required
-///
-/// Unlike `inline_hook(...)`, this API does not rely on signals once the patch
-/// is installed: control transfers directly to `replace_fn`.
-pub fn inline_hook_jump(address: u64, replace_fn: u64) HookError!u32 {
-    const patch = try aarch64.makeInlineJumpPatch(address, replace_fn);
-    var original: [aarch64.max_patch_len]u8 = undefined;
-
-    try memory.readInto(address, original[0..patch.len]);
-
-    const inserted = try state.rememberPatch(address, original[0..patch.len]);
-    errdefer if (inserted) state.discardPatch(address);
-
-    try memory.patchBytes(address, patch.bytes[0..patch.len]);
-
-    const saved_opcode = std.mem.readInt(u32, original[0..4], .little);
-    state.cacheOriginalOpcode(address, saved_opcode);
-    return saved_opcode;
-}
-
-/// Restores or unregisters runtime state for a previously hooked address.
+/// Removes a previously registered hook.
 ///
 /// Behavior depends on how the address was installed:
 /// - runtime patch APIs restore the original code bytes
-/// - `prepatched::*` APIs remove runtime dispatch state only
+/// - `prepatched.*` APIs remove dispatch state only and leave the existing
+///   `brk` instruction in place
 ///
-/// Calling `unhook` on a direct patch made by `patchcode`, `patch_bytes`, or
-/// `inline_hook_jump` restores the saved bytes and releases the cached slot.
+/// This call is not idempotent. If no hook exists for `address`, it returns
+/// `error.HookNotFound`.
+///
+/// Example:
+/// ```zig
+/// const zighook = @import("zighook");
+///
+/// fn removePatchpoint(address: u64) void {
+///     zighook.unhook(address) catch |err| switch (err) {
+///         error.HookNotFound => {},
+///         else => {},
+///     };
+/// }
+/// ```
 pub fn unhook(address: u64) HookError!void {
     if (state.slotByAddress(address)) |slot| {
         if (slot.runtime_patch_installed) {
@@ -167,61 +240,110 @@ pub fn unhook(address: u64) HookError!void {
 
         if (state.removeHook(address)) |removed_slot| {
             if (removed_slot.trampoline_pc != 0) {
-                trampoline.freeOriginalTrampoline(removed_slot.trampoline_pc);
+                aarch64.freeOriginalTrampoline(removed_slot.trampoline_pc);
             }
         }
 
         _ = state.removeCachedOriginalOpcode(address);
         return;
     }
-
-    const patch = state.takePatch(address) orelse return error.HookNotFound;
-    defer state.freeTakenPatch(patch);
-
-    try memory.patchBytes(address, patch.original);
-    _ = state.removeCachedOriginalOpcode(address);
+    return error.HookNotFound;
 }
 
-/// Returns the cached original 32-bit instruction word if it is known.
+/// Returns the known original 32-bit instruction word for `address`, if one is
+/// currently cached.
 ///
-/// This lookup covers:
-/// - direct patch slots
-/// - trap hook slots
-/// - explicit `prepatched.cache_original_opcode(...)` registrations
+/// Lookup sources:
+/// - a live trap hook slot created by `instrument*` or `inline_hook`
+/// - explicit metadata stored with `prepatched.cache_original_opcode(...)`
+///
+/// This is useful when higher-level tooling wants to inspect or log the opcode
+/// without reaching into internal registries.
+///
+/// Example:
+/// ```zig
+/// const zighook = @import("zighook");
+///
+/// fn logOpcode(address: u64) void {
+///     if (zighook.original_opcode(address)) |opcode| {
+///         _ = opcode;
+///     }
+/// }
+/// ```
 pub fn original_opcode(address: u64) ?u32 {
     return state.cachedOriginalOpcode(address) orelse
-        state.patchOriginalOpcode(address) orelse
         state.hookOriginalOpcode(address);
 }
 
-/// Convenience aliases that keep the external naming close to the Rust crate.
-pub const patchBytes = patch_bytes;
-pub const inlineHookJump = inline_hook_jump;
+/// CamelCase alias kept for callers that prefer the Rust crate naming.
 pub const originalOpcode = original_opcode;
 
-/// APIs for trap points that were patched offline before process startup.
+/// APIs for trap points that already contain `brk` before process startup.
+///
+/// This namespace is intended for offline patching workflows:
+/// - the binary was edited ahead of time
+/// - or another build step already emitted `brk` at known patch points
+/// - zighook only needs to register runtime dispatch state
+///
+/// `prepatched.inline_hook(...)` does not require extra metadata because it
+/// never needs to replay the displaced instruction.
+///
+/// `prepatched.instrument(...)` does require the original opcode. Call
+/// `prepatched.cache_original_opcode(...)` before registration so zighook knows
+/// what it must replay when the trap fires.
 pub const prepatched = struct {
-    /// Registers an already-trapped instruction and replays the original
-    /// instruction through a trampoline.
+    /// Registers an already-trapped instruction and replays the displaced
+    /// original opcode after the callback returns.
+    ///
+    /// Requirements:
+    /// - the executable page at `address` must already contain `brk`
+    /// - `prepatched.cache_original_opcode(address, opcode)` must have been
+    ///   called earlier with the displaced original instruction word
+    ///
+    /// Example:
+    /// ```zig
+    /// const zighook = @import("zighook");
+    ///
+    /// fn installPrepatched(address: u64, original_opcode: u32, callback: zighook.InstrumentCallback) void {
+    ///     zighook.prepatched.cache_original_opcode(address, original_opcode) catch {};
+    ///     _ = zighook.prepatched.instrument(address, callback) catch {};
+    /// }
+    /// ```
     pub fn instrument(address: u64, callback: InstrumentCallback) HookError!u32 {
         return instrumentInternal(address, callback, true, false, .prepatched);
     }
 
-    /// Registers an already-trapped instruction and skips the original
-    /// instruction by default.
+    /// Registers an already-trapped instruction and skips the displaced
+    /// original opcode unless the callback redirects `ctx.pc`.
+    ///
+    /// This is the prepatched equivalent of `instrument_no_original(...)`.
     pub fn instrument_no_original(address: u64, callback: InstrumentCallback) HookError!u32 {
         return instrumentInternal(address, callback, false, false, .prepatched);
     }
 
     /// Registers an already-trapped function entry hook.
+    ///
+    /// This is the prepatched equivalent of `inline_hook(...)`. Because the
+    /// callback returns directly to the caller by default, no cached original
+    /// opcode is required.
     pub fn inline_hook(address: u64, callback: InstrumentCallback) HookError!u32 {
         return instrumentInternal(address, callback, false, true, .prepatched);
     }
 
     /// Stores the original instruction word for a prepatched trap point.
     ///
-    /// This is required when using `prepatched.instrument(...)`, because the
-    /// executable page already contains `brk`, not the original instruction.
+    /// Call this before `prepatched.instrument(...)` whenever execute-original
+    /// replay is needed. The text page already contains `brk`, so zighook
+    /// cannot recover the displaced instruction by reading process memory.
+    ///
+    /// Example:
+    /// ```zig
+    /// const zighook = @import("zighook");
+    ///
+    /// fn rememberOriginal(address: u64, opcode: u32) void {
+    ///     zighook.prepatched.cache_original_opcode(address, opcode) catch {};
+    /// }
+    /// ```
     pub fn cache_original_opcode(address: u64, opcode: u32) HookError!void {
         if (address == 0 or (address & 0b11) != 0) return error.InvalidAddress;
         state.cacheOriginalOpcode(address, opcode);
@@ -231,7 +353,7 @@ pub const prepatched = struct {
 /// Ensures that a `prepatched::*` registration really points at a trap site.
 fn ensurePrepatchedTrap(address: u64) HookError!void {
     const opcode = try memory.readU32(address);
-    if (!memory.isBrk(opcode)) return error.InvalidAddress;
+    if (!aarch64.isBrk(opcode)) return error.InvalidAddress;
 }
 
 fn instrumentInternal(
@@ -266,7 +388,7 @@ fn instrumentInternal(
 
     try signal.ensureHandlersInstalled();
 
-    const step_len = try memory.instructionWidth(address);
+    const step_len = try aarch64.instructionWidth(address);
 
     var original_bytes_storage: [4]u8 = undefined;
     var saved_opcode: u32 = undefined;
@@ -276,7 +398,7 @@ fn instrumentInternal(
         .runtime_patch => {
             // Replace the target instruction with `brk` immediately and keep
             // the original opcode for replay or later restoration.
-            saved_opcode = try memory.patchU32(address, constants.brk_opcode);
+            saved_opcode = try memory.patchU32(address, aarch64.brk_opcode);
             original_bytes_storage = std.mem.toBytes(std.mem.nativeToLittle(u32, saved_opcode));
             runtime_patch_installed = true;
         },
@@ -325,412 +447,4 @@ fn instrumentInternal(
 fn planExecuteOriginalReplay(address: u64) HookError!aarch64.ReplayPlan {
     const opcode = state.cachedOriginalOpcode(address) orelse try memory.readU32(address);
     return aarch64.planReplay(address, opcode);
-}
-
-extern fn demo_add_target(a: i32, b: i32) callconv(.c) i32;
-extern fn demo_mul_replacement(a: i32, b: i32) callconv(.c) i32;
-extern var demo_add_patchpoint: u8;
-extern fn demo_adr_target() callconv(.c) u64;
-extern var demo_adr_patchpoint: u8;
-extern var demo_adr_expected: u8;
-extern fn demo_adrp_target() callconv(.c) u64;
-extern var demo_adrp_patchpoint: u8;
-extern var demo_adrp_data: u8;
-extern fn demo_ldr_x_literal_target() callconv(.c) u64;
-extern var demo_ldr_x_literal_patchpoint: u8;
-extern fn demo_ldr_w_literal_target() callconv(.c) u32;
-extern var demo_ldr_w_literal_patchpoint: u8;
-extern fn demo_ldr_s_literal_target(out: [*]u8) callconv(.c) void;
-extern var demo_ldr_s_literal_patchpoint: u8;
-extern fn demo_ldr_d_literal_target(out: [*]u8) callconv(.c) void;
-extern var demo_ldr_d_literal_patchpoint: u8;
-extern fn demo_ldr_q_literal_target(out: [*]u8) callconv(.c) void;
-extern var demo_ldr_q_literal_patchpoint: u8;
-extern fn demo_ldrsw_literal_target() callconv(.c) i64;
-extern var demo_ldrsw_literal_patchpoint: u8;
-extern fn demo_bl_target() callconv(.c) i32;
-extern var demo_bl_patchpoint: u8;
-extern fn demo_b_eq_target(a: i32, b: i32) callconv(.c) i32;
-extern var demo_b_eq_patchpoint: u8;
-extern fn demo_cbz_target(a: u64) callconv(.c) i32;
-extern var demo_cbz_patchpoint: u8;
-extern fn demo_tbz_target(a: u64) callconv(.c) i32;
-extern var demo_tbz_patchpoint: u8;
-extern fn demo_fp_context_target(out: [*]u8) callconv(.c) void;
-extern var demo_fp_context_patchpoint: u8;
-
-fn signalReturn42(_: u64, ctx: *HookContext) callconv(.c) void {
-    ctx.regs.named.x0 = 42;
-}
-
-fn signalReturn99(_: u64, ctx: *HookContext) callconv(.c) void {
-    ctx.regs.named.x0 = 99;
-}
-
-fn signalPrepare42(_: u64, ctx: *HookContext) callconv(.c) void {
-    ctx.regs.named.x0 = 40;
-    ctx.regs.named.x1 = 2;
-}
-
-fn signalNoop(_: u64, _: *HookContext) callconv(.c) void {}
-
-const callback_q0_pattern: u128 =
-    (@as(u128, 0x1122_3344_5566_7788) << 64) | 0x99AA_BBCC_DDEE_FF00;
-const literal_q_pattern: u128 =
-    (@as(u128, 0x0F1E_2D3C_4B5A_6978) << 64) | 0x8877_6655_4433_2211;
-
-fn signalWriteQ0Pattern(_: u64, ctx: *HookContext) callconv(.c) void {
-    ctx.fpregs.v[0] = callback_q0_pattern;
-}
-
-fn readVectorBits(bytes: []const u8) u128 {
-    return std.mem.readInt(u128, bytes[0..16], .little);
-}
-
-test "patchcode detours and unhook restores" {
-    const target_addr: u64 = @intFromPtr(&demo_add_target);
-    const replacement_addr: u64 = @intFromPtr(&demo_mul_replacement);
-    const branch_opcode = try aarch64.encodeBranch(target_addr, replacement_addr);
-
-    try std.testing.expectEqual(@as(i32, 5), demo_add_target(2, 3));
-
-    var restored = false;
-    defer if (!restored) unhook(target_addr) catch {};
-
-    const original = try patchcode(target_addr, branch_opcode);
-    try std.testing.expectEqual(original, original_opcode(target_addr).?);
-    try std.testing.expectEqual(@as(i32, 6), demo_add_target(2, 3));
-
-    try unhook(target_addr);
-    restored = true;
-
-    try std.testing.expectEqual(@as(i32, 5), demo_add_target(2, 3));
-    try std.testing.expectEqual(@as(?u32, null), original_opcode(target_addr));
-}
-
-test "patch_bytes writes a raw branch patch" {
-    const target_addr: u64 = @intFromPtr(&demo_add_target);
-    const replacement_addr: u64 = @intFromPtr(&demo_mul_replacement);
-    const branch_opcode = try aarch64.encodeBranch(target_addr, replacement_addr);
-    const patch = std.mem.toBytes(std.mem.nativeToLittle(u32, branch_opcode));
-
-    try std.testing.expectEqual(@as(i32, 11), demo_add_target(5, 6));
-
-    var restored = false;
-    defer if (!restored) unhook(target_addr) catch {};
-
-    const original = try patch_bytes(std.testing.allocator, target_addr, patch[0..]);
-    defer std.testing.allocator.free(original);
-
-    try std.testing.expectEqual(@as(usize, 4), original.len);
-    try std.testing.expectEqual(std.mem.readInt(u32, original[0..4], .little), original_opcode(target_addr).?);
-    try std.testing.expectEqual(@as(i32, 30), demo_add_target(5, 6));
-
-    try unhook(target_addr);
-    restored = true;
-
-    try std.testing.expectEqual(@as(i32, 11), demo_add_target(5, 6));
-}
-
-test "inline_hook_jump detours and restores" {
-    const target_addr: u64 = @intFromPtr(&demo_add_target);
-    const replacement_addr: u64 = @intFromPtr(&demo_mul_replacement);
-
-    try std.testing.expectEqual(@as(i32, 15), demo_add_target(7, 8));
-
-    var restored = false;
-    defer if (!restored) unhook(target_addr) catch {};
-
-    const original = try inline_hook_jump(target_addr, replacement_addr);
-    try std.testing.expectEqual(original, original_opcode(target_addr).?);
-    try std.testing.expectEqual(@as(i32, 56), demo_add_target(7, 8));
-
-    try unhook(target_addr);
-    restored = true;
-
-    try std.testing.expectEqual(@as(i32, 15), demo_add_target(7, 8));
-}
-
-test "inline_hook returns directly from the callback" {
-    const target_addr: u64 = @intFromPtr(&demo_add_target);
-
-    try std.testing.expectEqual(@as(i32, 7), demo_add_target(3, 4));
-
-    var restored = false;
-    defer if (!restored) unhook(target_addr) catch {};
-
-    _ = try inline_hook(target_addr, signalReturn42);
-    try std.testing.expectEqual(@as(i32, 42), demo_add_target(3, 4));
-
-    try unhook(target_addr);
-    restored = true;
-
-    try std.testing.expectEqual(@as(i32, 7), demo_add_target(3, 4));
-}
-
-test "instrument executes the original instruction via trampoline" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_add_patchpoint);
-
-    try std.testing.expectEqual(@as(i32, 7), demo_add_target(3, 4));
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalPrepare42);
-    try std.testing.expectEqual(@as(i32, 42), demo_add_target(3, 4));
-
-    try unhook(patchpoint_addr);
-    restored = true;
-
-    try std.testing.expectEqual(@as(i32, 7), demo_add_target(3, 4));
-}
-
-test "instrument_no_original skips the trapped instruction" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_add_patchpoint);
-
-    try std.testing.expectEqual(@as(i32, 7), demo_add_target(3, 4));
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument_no_original(patchpoint_addr, signalReturn99);
-    try std.testing.expectEqual(@as(i32, 99), demo_add_target(3, 4));
-
-    try unhook(patchpoint_addr);
-    restored = true;
-
-    try std.testing.expectEqual(@as(i32, 7), demo_add_target(3, 4));
-}
-
-test "instrument_no_original writes back callback-edited q0 state" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_fp_context_patchpoint);
-    var out: [16]u8 = [_]u8{0} ** 16;
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument_no_original(patchpoint_addr, signalWriteQ0Pattern);
-    demo_fp_context_target(out[0..].ptr);
-    try std.testing.expectEqual(callback_q0_pattern, readVectorBits(out[0..]));
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays adr at the original PC" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_adr_patchpoint);
-    const expected_addr: u64 = @intFromPtr(&demo_adr_expected);
-
-    try std.testing.expectEqual(expected_addr, demo_adr_target());
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    try std.testing.expectEqual(expected_addr, demo_adr_target());
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays adrp at the original PC" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_adrp_patchpoint);
-    const expected_page = @intFromPtr(&demo_adrp_data) & ~@as(u64, 0xFFF);
-
-    try std.testing.expectEqual(expected_page, demo_adrp_target());
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    try std.testing.expectEqual(expected_page, demo_adrp_target());
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays ldr literal into x register" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_ldr_x_literal_patchpoint);
-
-    try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), demo_ldr_x_literal_target());
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), demo_ldr_x_literal_target());
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays ldr literal into w register" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_ldr_w_literal_patchpoint);
-
-    try std.testing.expectEqual(@as(u32, 0x89AB_CDEF), demo_ldr_w_literal_target());
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    try std.testing.expectEqual(@as(u32, 0x89AB_CDEF), demo_ldr_w_literal_target());
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays ldr literal into s register and clears upper q bits" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_ldr_s_literal_patchpoint);
-    var out: [16]u8 = [_]u8{0} ** 16;
-
-    demo_ldr_s_literal_target(out[0..].ptr);
-    try std.testing.expectEqual(@as(u128, 0x3F80_0000), readVectorBits(out[0..]));
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    out = [_]u8{0} ** 16;
-    demo_ldr_s_literal_target(out[0..].ptr);
-    try std.testing.expectEqual(@as(u128, 0x3F80_0000), readVectorBits(out[0..]));
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays ldr literal into d register and clears upper q bits" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_ldr_d_literal_patchpoint);
-    var out: [16]u8 = [_]u8{0} ** 16;
-
-    demo_ldr_d_literal_target(out[0..].ptr);
-    try std.testing.expectEqual(@as(u128, 0x4000_0000_0000_0000), readVectorBits(out[0..]));
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    out = [_]u8{0} ** 16;
-    demo_ldr_d_literal_target(out[0..].ptr);
-    try std.testing.expectEqual(@as(u128, 0x4000_0000_0000_0000), readVectorBits(out[0..]));
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays ldr literal into q register" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_ldr_q_literal_patchpoint);
-    var out: [16]u8 = [_]u8{0} ** 16;
-
-    demo_ldr_q_literal_target(out[0..].ptr);
-    try std.testing.expectEqual(literal_q_pattern, readVectorBits(out[0..]));
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    out = [_]u8{0} ** 16;
-    demo_ldr_q_literal_target(out[0..].ptr);
-    try std.testing.expectEqual(literal_q_pattern, readVectorBits(out[0..]));
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays ldrsw literal with sign extension" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_ldrsw_literal_patchpoint);
-
-    try std.testing.expectEqual(@as(i64, -128), demo_ldrsw_literal_target());
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    try std.testing.expectEqual(@as(i64, -128), demo_ldrsw_literal_target());
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays bl by branching at the original target" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_bl_patchpoint);
-
-    try std.testing.expectEqual(@as(i32, 77), demo_bl_target());
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    try std.testing.expectEqual(@as(i32, 77), demo_bl_target());
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays b.cond from live cpsr flags" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_b_eq_patchpoint);
-
-    try std.testing.expectEqual(@as(i32, 2), demo_b_eq_target(5, 5));
-    try std.testing.expectEqual(@as(i32, 1), demo_b_eq_target(5, 6));
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    try std.testing.expectEqual(@as(i32, 2), demo_b_eq_target(5, 5));
-    try std.testing.expectEqual(@as(i32, 1), demo_b_eq_target(5, 6));
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays cbz from live register state" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_cbz_patchpoint);
-
-    try std.testing.expectEqual(@as(i32, 4), demo_cbz_target(0));
-    try std.testing.expectEqual(@as(i32, 3), demo_cbz_target(9));
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    try std.testing.expectEqual(@as(i32, 4), demo_cbz_target(0));
-    try std.testing.expectEqual(@as(i32, 3), demo_cbz_target(9));
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "instrument replays tbz from live register state" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_tbz_patchpoint);
-
-    try std.testing.expectEqual(@as(i32, 6), demo_tbz_target(0));
-    try std.testing.expectEqual(@as(i32, 5), demo_tbz_target(8));
-
-    var restored = false;
-    defer if (!restored) unhook(patchpoint_addr) catch {};
-
-    _ = try instrument(patchpoint_addr, signalNoop);
-    try std.testing.expectEqual(@as(i32, 6), demo_tbz_target(0));
-    try std.testing.expectEqual(@as(i32, 5), demo_tbz_target(8));
-
-    try unhook(patchpoint_addr);
-    restored = true;
-}
-
-test "prepatched inline_hook unregisters runtime state without restoring text" {
-    const patchpoint_addr: u64 = @intFromPtr(&demo_add_patchpoint);
-    const original = try patchcode(patchpoint_addr, constants.brk_opcode);
-    defer {
-        // First remove runtime state if still present, then restore the original
-        // instruction patch if the direct patch record still exists.
-        unhook(patchpoint_addr) catch {};
-        unhook(patchpoint_addr) catch {};
-    }
-
-    try prepatched.cache_original_opcode(patchpoint_addr, original);
-    _ = try prepatched.inline_hook(patchpoint_addr, signalReturn42);
-    try std.testing.expectEqual(@as(i32, 42), demo_add_target(3, 4));
-
-    try unhook(patchpoint_addr);
-    try std.testing.expectEqual(@as(u32, original), original_opcode(patchpoint_addr).?);
 }
