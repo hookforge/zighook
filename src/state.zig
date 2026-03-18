@@ -6,6 +6,11 @@
 //! - no hash maps
 //! - no locking in the hot signal path
 //!
+//! **Thread-safety:** This module is intentionally single-threaded. There is no
+//! synchronization between the signal handler and the registration APIs. All
+//! calls to the public hook APIs should be made from a single thread before any
+//! trap fires, matching the usage model of the original Rust crate.
+//!
 //! This is not intended as a forever design, but it keeps the first rewrite
 //! deterministic and close to the original crate's behavior.
 
@@ -273,6 +278,11 @@ pub fn cacheOriginalOpcode(address: u64, opcode: u32) void {
     // storage fixed-size like the Rust crate and avoids heap allocation in
     // public registration paths.
     const replace_index = original_opcode_replace_index % constants.max_hooks;
+    const evicted_address = original_opcode_slots[replace_index].address;
+    std.log.debug("zighook: original opcode cache full; evicting slot {d} (address=0x{X})", .{
+        replace_index,
+        evicted_address,
+    });
     original_opcode_slots[replace_index] = .{
         .used = true,
         .address = address,

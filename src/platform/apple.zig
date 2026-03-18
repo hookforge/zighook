@@ -64,19 +64,34 @@ pub fn flushInstructionCache(address: [*]u8, len: usize) void {
 
 fn computeProtectRange(address: usize, len: usize) ProtectRange {
     const page_size = std.heap.pageSize();
-    const start = address & ~(page_size - 1);
-    const end_inclusive = address + len - 1;
-    const end_page = end_inclusive & ~(page_size - 1);
-
+    const start = std.mem.alignBackward(usize, address, page_size);
+    const end = std.mem.alignForward(usize, address + len, page_size);
     return .{
         .start = start,
-        .len = (end_page + page_size) - start,
+        .len = end - start,
     };
 }
 
 test "computeProtectRange spans exactly one page" {
     const page_size = std.heap.pageSize();
     const range = computeProtectRange(0x1003, 4);
-    try std.testing.expectEqual(@as(usize, 0x1003) & ~(page_size - 1), range.start);
+    try std.testing.expectEqual(std.mem.alignBackward(usize, 0x1003, page_size), range.start);
+    try std.testing.expectEqual(page_size, range.len);
+}
+
+test "computeProtectRange spans two pages when patch crosses a page boundary" {
+    const page_size = std.heap.pageSize();
+    // Place the address 2 bytes before the end of the first page so that a
+    // small patch definitely crosses into the next page.
+    const near_end = page_size - 2;
+    const range = computeProtectRange(near_end, 8);
+    try std.testing.expectEqual(@as(usize, 0), range.start);
+    try std.testing.expectEqual(2 * page_size, range.len);
+}
+
+test "computeProtectRange starts exactly at a page boundary" {
+    const page_size = std.heap.pageSize();
+    const range = computeProtectRange(page_size, 4);
+    try std.testing.expectEqual(page_size, range.start);
     try std.testing.expectEqual(page_size, range.len);
 }
