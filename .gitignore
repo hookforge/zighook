@@ -1,0 +1,10 @@
+.zig-cache/
+zig-out/
+root_test_bin
+*.o
+*.obj
+*.a
+*.so
+*.dylib.dSYM/
+*.exe
+.DS_Store

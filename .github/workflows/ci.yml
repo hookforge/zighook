@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  zig-macos-aarch64:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Zig fmt
+        run: |
+          zig fmt --check \
+            build.zig \
+            src/*.zig \
+            src/arch/*.zig \
+            src/platform/*.zig \
+            examples/*/main.zig \
+            examples/support/*.zig \
+            examples/preload/*.zig
+
+      - name: Zig build
+        run: zig build
+
+      - name: Zig test
+        run: zig build test
+
+      - name: Build examples
+        run: zig build examples
+
+      - name: Run preload smoke tests
+        run: zig build preload-smoke
