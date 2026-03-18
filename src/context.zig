@@ -149,3 +149,63 @@ pub fn writeBackMachineContext(mcontext: *std.c.mcontext_t, ctx: *const HookCont
     mcontext.ns.fpsr = ctx.fpregs.fpsr;
     mcontext.ns.fpcr = ctx.fpregs.fpcr;
 }
+
+test "Darwin machine context remap round-trips integer and FP state" {
+    var mcontext = std.mem.zeroes(std.c.mcontext_t);
+
+    for (mcontext.ss.regs[0..], 0..) |*reg, index| {
+        reg.* = 0x1000 + index;
+    }
+    mcontext.ss.fp = 0x2000;
+    mcontext.ss.lr = 0x3000;
+    mcontext.ss.sp = 0x4000;
+    mcontext.ss.pc = 0x5000;
+    mcontext.ss.cpsr = 0x6000;
+    mcontext.ss.__pad = 0x7000;
+
+    for (mcontext.ns.q[0..], 0..) |*reg, index| {
+        reg.* = (@as(u128, index) << 64) | (0xA0 + index);
+    }
+    mcontext.ns.fpsr = 0x8000;
+    mcontext.ns.fpcr = 0x9000;
+
+    var ctx = captureMachineContext(&mcontext);
+
+    try std.testing.expectEqual(@as(u64, 0x1000), ctx.regs.x[0]);
+    try std.testing.expectEqual(@as(u64, 0x101C), ctx.regs.x[28]);
+    try std.testing.expectEqual(@as(u64, 0x2000), ctx.regs.x[29]);
+    try std.testing.expectEqual(@as(u64, 0x3000), ctx.regs.x[30]);
+    try std.testing.expectEqual(@as(u64, 0x4000), ctx.sp);
+    try std.testing.expectEqual(@as(u64, 0x5000), ctx.pc);
+    try std.testing.expectEqual(@as(u32, 0x6000), ctx.cpsr);
+    try std.testing.expectEqual(@as(u32, 0x7000), ctx.pad);
+    try std.testing.expectEqual((@as(u128, 31) << 64) | 0xBF, ctx.fpregs.v[31]);
+    try std.testing.expectEqual(@as(u32, 0x8000), ctx.fpregs.fpsr);
+    try std.testing.expectEqual(@as(u32, 0x9000), ctx.fpregs.fpcr);
+
+    ctx.regs.x[0] = 0xDEAD;
+    ctx.regs.x[29] = 0xBEEF;
+    ctx.regs.x[30] = 0xCAFE;
+    ctx.sp = 0x1111;
+    ctx.pc = 0x2222;
+    ctx.cpsr = 0x3333;
+    ctx.pad = 0x4444;
+    ctx.fpregs.v[0] = 0x1122_3344_5566_7788;
+    ctx.fpregs.v[31] = (@as(u128, 0x9999_AAAA_BBBB_CCCC) << 64) | 0xDDDD_EEEE_FFFF_0000;
+    ctx.fpregs.fpsr = 0x5555;
+    ctx.fpregs.fpcr = 0x6666;
+
+    writeBackMachineContext(&mcontext, &ctx);
+
+    try std.testing.expectEqual(@as(u64, 0xDEAD), mcontext.ss.regs[0]);
+    try std.testing.expectEqual(@as(u64, 0xBEEF), mcontext.ss.fp);
+    try std.testing.expectEqual(@as(u64, 0xCAFE), mcontext.ss.lr);
+    try std.testing.expectEqual(@as(u64, 0x1111), mcontext.ss.sp);
+    try std.testing.expectEqual(@as(u64, 0x2222), mcontext.ss.pc);
+    try std.testing.expectEqual(@as(u32, 0x3333), mcontext.ss.cpsr);
+    try std.testing.expectEqual(@as(u32, 0x4444), mcontext.ss.__pad);
+    try std.testing.expectEqual(@as(u128, 0x1122_3344_5566_7788), mcontext.ns.q[0]);
+    try std.testing.expectEqual((@as(u128, 0x9999_AAAA_BBBB_CCCC) << 64) | 0xDDDD_EEEE_FFFF_0000, mcontext.ns.q[31]);
+    try std.testing.expectEqual(@as(u32, 0x5555), mcontext.ns.fpsr);
+    try std.testing.expectEqual(@as(u32, 0x6666), mcontext.ns.fpcr);
+}

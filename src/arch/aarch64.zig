@@ -624,3 +624,39 @@ test "condition evaluator matches common NZCV predicates" {
     try std.testing.expect(conditionHolds(n_set, 0xB));
     try std.testing.expect(conditionHolds(0, 0xE));
 }
+
+test "FP literal replay updates q registers with the correct scalar semantics" {
+    const literal_s: u32 = 0x3F80_0000;
+    const literal_d: u64 = 0x4000_0000_0000_0000;
+    const literal_q: u128 =
+        (@as(u128, 0x0F1E_2D3C_4B5A_6978) << 64) | 0x8877_6655_4433_2211;
+
+    var ctx = std.mem.zeroes(HookContext);
+    ctx.fpregs.v[1] = std.math.maxInt(u128);
+    ctx.fpregs.v[2] = std.math.maxInt(u128);
+    ctx.fpregs.v[3] = std.math.maxInt(u128);
+
+    try applyReplay(
+        .{ .ldr_literal_s = .{ .rt = 1, .literal_address = @intFromPtr(&literal_s) } },
+        0x1000,
+        &ctx,
+    );
+    try std.testing.expectEqual(@as(u128, literal_s), ctx.fpregs.v[1]);
+    try std.testing.expectEqual(@as(u64, 0x1004), ctx.pc);
+
+    try applyReplay(
+        .{ .ldr_literal_d = .{ .rt = 2, .literal_address = @intFromPtr(&literal_d) } },
+        0x2000,
+        &ctx,
+    );
+    try std.testing.expectEqual(@as(u128, literal_d), ctx.fpregs.v[2]);
+    try std.testing.expectEqual(@as(u64, 0x2004), ctx.pc);
+
+    try applyReplay(
+        .{ .ldr_literal_q = .{ .rt = 3, .literal_address = @intFromPtr(&literal_q) } },
+        0x3000,
+        &ctx,
+    );
+    try std.testing.expectEqual(literal_q, ctx.fpregs.v[3]);
+    try std.testing.expectEqual(@as(u64, 0x3004), ctx.pc);
+}
