@@ -5,6 +5,8 @@ const zighook = @import("zighook");
 
 extern fn demo_add_target(a: i32, b: i32) callconv(.c) i32;
 extern fn demo_add_patchpoint() callconv(.c) void;
+extern fn demo_direct_call_target(a: i32, b: i32) callconv(.c) i32;
+extern fn demo_direct_call_patchpoint() callconv(.c) void;
 extern fn demo_stack_call_target(a: i32, b: i32) callconv(.c) i32;
 extern fn demo_stack_call_patchpoint() callconv(.c) void;
 extern fn demo_prepatched_target() callconv(.c) i32;
@@ -63,6 +65,19 @@ test "x86_64 instrument replays stack-pointer indirect calls" {
 
     _ = try zighook.instrument(patchpoint_addr, signalReplay42);
     try std.testing.expectEqual(@as(i32, 42), demo_stack_call_target(1, 2));
+    const saved = zighook.original_instruction(patchpoint_addr) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(saved.slice().len > 0);
+}
+
+test "x86_64 instrument replays direct calls" {
+    if (builtin.cpu.arch != .x86_64) return;
+
+    const patchpoint_addr: u64 = @intFromPtr(&demo_direct_call_patchpoint);
+
+    defer zighook.unhook(patchpoint_addr) catch {};
+
+    _ = try zighook.instrument(patchpoint_addr, signalReplay42);
+    try std.testing.expectEqual(@as(i32, 42), demo_direct_call_target(1, 2));
     const saved = zighook.original_instruction(patchpoint_addr) orelse return error.TestUnexpectedResult;
     try std.testing.expect(saved.slice().len > 0);
 }

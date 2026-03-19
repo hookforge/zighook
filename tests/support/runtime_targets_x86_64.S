@@ -15,6 +15,21 @@ SYM(demo_add_patchpoint):
     leal (%rdi,%rsi), %eax
     ret
 
+// Replay test for ordinary direct calls. The patchpoint is the `call rel32`
+// itself so the execute-original trampoline must synthesize the pushed return
+// address before transferring control to the final callee.
+.globl SYM(demo_direct_call_target)
+.globl SYM(demo_direct_call_patchpoint)
+SYM(demo_direct_call_target):
+SYM(demo_direct_call_patchpoint):
+    call SYM(demo_direct_call_impl)
+    ret
+
+.globl SYM(demo_direct_call_impl)
+SYM(demo_direct_call_impl):
+    leal (%rdi,%rsi), %eax
+    ret
+
 // Replay test for stack-pointer-based indirect calls. The patchpoint is the
 // indirect call through the top-of-stack function pointer slot.
 .globl SYM(demo_stack_call_target)

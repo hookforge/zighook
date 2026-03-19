@@ -42,13 +42,19 @@ const TrampolineEmitter = struct {
     }
 
     fn emitAbsolutePush(self: *TrampolineEmitter, value: u64) HookError!void {
-        // `push qword ptr [rip+0]` followed by an inline literal. This is used
-        // to synthesize the architectural "return address push" side effect of
-        // a displaced `call`.
-        const opcode = [_]u8{ 0xFF, 0x35, 0x00, 0x00, 0x00, 0x00 };
+        // x86_64 has no `push imm64`. We therefore synthesize one without
+        // permanently clobbering architectural state:
+        //   push rax
+        //   movabs rax, imm64
+        //   xchg qword ptr [rsp], rax
+        //
+        // After the final `xchg`, the stack top contains `value` and `rax`
+        // regains its original pre-push contents.
         const literal = std.mem.toBytes(std.mem.nativeToLittle(u64, value));
-        try self.emit(opcode[0..]);
+        try self.emit(&.{0x50});
+        try self.emit(&.{ 0x48, 0xB8 });
         try self.emit(literal[0..]);
+        try self.emit(&.{ 0x48, 0x87, 0x04, 0x24 });
     }
 
     fn emitStackPointerIndirectJump(
