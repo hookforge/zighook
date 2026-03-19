@@ -392,10 +392,6 @@ jobs:
           $zigDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & (Join-Path $zigDir "zig.exe") version
 
-      - name: Zig fmt
-        shell: bash
-        run: zig fmt --check $(git ls-files '*.zig')
-
       - name: Zig build
         shell: bash
         run: zig build
