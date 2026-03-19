@@ -41,7 +41,7 @@ Implemented AArch64 platform backends:
 Verification status:
 
 - macOS AArch64: runtime-tested locally and in CI
-- Linux AArch64: cross-compiled core library and ELF payload locally
+- Linux AArch64: runtime-tested in CI
 - iOS AArch64: cross-compiled core dylib and Mach-O payload locally
 - Android AArch64: compiled core/payload objects against a local NDK sysroot
 
