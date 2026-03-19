@@ -4,7 +4,8 @@
 //! 1. replays the original instruction
 //! 2. jumps back to the instruction that follows the trap patch
 //!
-//! For the first backend slice this is implemented only for AArch64 macOS.
+//! The emitted code is ISA-specific, while page allocation and cache
+//! maintenance come from the platform layer.
 
 const std = @import("std");
 
@@ -23,19 +24,8 @@ const memory = @import("../../memory.zig");
 pub fn createOriginalTrampoline(address: u64, original_bytes: []const u8, step_len: u8) HookError!u64 {
     if (original_bytes.len != 4 or step_len != 4) return error.InvalidAddress;
 
-    const page_size = std.heap.pageSize();
-    const mapped = std.posix.mmap(
-        null,
-        page_size,
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
-        .{
-            .TYPE = .PRIVATE,
-            .ANONYMOUS = true,
-        },
-        -1,
-        0,
-    ) catch return error.TrampolineAllocationFailed;
-    errdefer std.posix.munmap(mapped);
+    const mapped = try memory.allocateTrampolinePage(address, .generic);
+    errdefer memory.freeTrampolinePage(@intFromPtr(mapped.ptr));
 
     const next_pc = address + step_len;
     const original_opcode = std.mem.readInt(u32, original_bytes[0..4], .little);
@@ -63,9 +53,5 @@ pub fn createOriginalTrampoline(address: u64, original_bytes: []const u8, step_l
 
 /// Releases a trampoline previously returned by `createOriginalTrampoline`.
 pub fn freeOriginalTrampoline(trampoline_pc: u64) void {
-    if (trampoline_pc == 0) return;
-
-    const page_size = std.heap.pageSize();
-    const ptr: [*]align(std.heap.page_size_min) const u8 = @ptrFromInt(@as(usize, @intCast(trampoline_pc)));
-    std.posix.munmap(ptr[0..page_size]);
+    memory.freeTrampolinePage(trampoline_pc);
 }

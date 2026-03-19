@@ -1,9 +1,11 @@
 //! Memory helpers shared by patching, trap handling, and trampoline creation.
 
-const builtin = @import("builtin");
 const std = @import("std");
 
 const HookError = @import("error.zig").HookError;
+const platform_memory = @import("platform/memory_root.zig");
+
+pub const TrampolineKind = platform_memory.TrampolineKind;
 
 /// Reads arbitrary bytes from the current process image.
 ///
@@ -42,11 +44,7 @@ pub fn patchU32(address: u64, new_opcode: u32) HookError!u32 {
 /// - flushing the instruction cache afterwards
 /// - restoring executable protection
 pub fn patchBytes(address: u64, bytes: []const u8) HookError!void {
-    return switch (builtin.os.tag) {
-        .macos, .ios => @import("platform/apple.zig").patchBytes(address, bytes),
-        .linux => @import("platform/linux.zig").patchBytes(address, bytes),
-        else => error.UnsupportedPlatform,
-    };
+    return platform_memory.patchBytes(address, bytes);
 }
 
 /// Flushes the instruction cache after writing code.
@@ -54,9 +52,20 @@ pub fn patchBytes(address: u64, bytes: []const u8) HookError!void {
 /// On self-modifying code paths this step is essential on AArch64, otherwise
 /// the CPU may continue executing stale instructions fetched before the patch.
 pub fn flushInstructionCache(address: [*]u8, len: usize) void {
-    switch (builtin.os.tag) {
-        .macos, .ios => @import("platform/apple.zig").flushInstructionCache(address, len),
-        .linux => @import("platform/linux.zig").flushInstructionCache(address, len),
-        else => {},
-    }
+    platform_memory.flushInstructionCache(address, len);
+}
+
+/// Allocates a writable page that an ISA backend can fill with trampoline code.
+///
+/// `address_hint` is the original instruction address. Some backends, such as
+/// x86_64 RIP-relative replay, require the trampoline to live near that
+/// address so relocated displacements remain encodable.
+pub fn allocateTrampolinePage(address_hint: u64, kind: TrampolineKind) HookError![]align(std.heap.page_size_min) u8 {
+    return platform_memory.allocateTrampolinePage(address_hint, kind);
+}
+
+/// Releases a trampoline page previously allocated through
+/// `allocateTrampolinePage(...)`.
+pub fn freeTrampolinePage(trampoline_pc: u64) void {
+    platform_memory.freeTrampolinePage(trampoline_pc);
 }

@@ -64,6 +64,11 @@ const TrampolineEmitter = struct {
     ) HookError!void {
         if (!decoded.canRewriteStackPointerIndirectCall()) return error.ReplayUnsupported;
 
+        // Rebuild the memory form directly instead of mutating the original
+        // bytes in place. The trampoline may have just synthesized a return
+        // address with `emitAbsolutePush(...)`, which shifts `rsp` by 8 bytes.
+        // Re-encoding from structured decode data lets us compensate for that
+        // stack movement while preserving the original addressing mode.
         const adjusted_disp = @as(i64, decoded.mem_disp) + @as(i64, stack_adjust);
         const index_bits = try registerBits(decoded.mem_index);
         const scale_bits: u8 = if (decoded.mem_index == .none) 0 else try sibScaleBits(decoded.mem_scale);
@@ -144,6 +149,9 @@ fn patchRelativeImmediate(
     instruction_pc: u64,
     target: u64,
 ) HookError!void {
+    // x86 relative immediates are measured from the end of the instruction.
+    // After relocation into the trampoline we therefore recompute the encoded
+    // displacement against the trampoline-local `next_pc`.
     const next_pc = @as(i128, @intCast(instruction_pc + decoded.length));
     const displacement = @as(i128, @intCast(target)) - next_pc;
     try writeRelativeOffset(bytes, decoded.imm_offset, decoded.imm_size, @intCast(displacement));
@@ -184,26 +192,29 @@ fn copyInstruction(original_bytes: []const u8, step_len: u8) HookError![16]u8 {
     return bytes;
 }
 
+/// Builds an out-of-line replay trampoline for one displaced x86_64
+/// instruction.
+///
+/// Zydis already answered the hard decode questions for us:
+/// - instruction length
+/// - whether the opcode is plain/control-flow/return
+/// - where relative immediates or RIP-relative displacements live
+///
+/// This function turns that structured decode into executable trampoline bytes
+/// that preserve the original architectural effect and then return to the
+/// program at the correct continuation point.
 pub fn createOriginalTrampoline(address: u64, original_bytes: []const u8, step_len: u8) HookError!u64 {
     const decoded = try decoder.decodeInstruction(address, original_bytes);
     if (decoded.length != step_len) return error.InvalidAddress;
 
-    const page_size = std.heap.pageSize();
-    const page_mask = @as(u64, @intCast(page_size - 1));
-    const hint_addr = address & ~page_mask;
-    const hint: ?[*]align(std.heap.page_size_min) u8 = @ptrFromInt(@as(usize, @intCast(hint_addr)));
-    const mapped = std.posix.mmap(
-        hint,
-        page_size,
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
-        .{
-            .TYPE = .PRIVATE,
-            .ANONYMOUS = true,
-        },
-        -1,
-        0,
-    ) catch return error.TrampolineAllocationFailed;
-    errdefer std.posix.munmap(mapped);
+    // RIP-relative instructions need the trampoline to stay close enough that
+    // the relocated displacement still fits in signed 32 bits. Other
+    // instruction classes can use any executable scratch page.
+    const mapped = if (decoded.hasRipRelativeMemory())
+        try memory.allocateTrampolinePage(address, .rip_relative)
+    else
+        try memory.allocateTrampolinePage(address, .generic);
+    errdefer memory.freeTrampolinePage(@intFromPtr(mapped.ptr));
 
     var emitter = TrampolineEmitter{
         .mapped = mapped,
@@ -225,6 +236,10 @@ pub fn createOriginalTrampoline(address: u64, original_bytes: []const u8, step_l
         .direct_call => {
             // Preserve call semantics without using a relative encoding that
             // depends on trampoline placement.
+            //
+            // A real `call` would push `next_pc` before transferring control.
+            // We synthesize that exact stack effect first and then use an
+            // absolute jump so trampoline placement no longer matters.
             try emitter.emitAbsolutePush(next_pc);
             try emitter.emitAbsoluteJump(decoded.absolute_target);
         },
@@ -238,10 +253,13 @@ pub fn createOriginalTrampoline(address: u64, original_bytes: []const u8, step_l
                 var bytes = try copyInstruction(original_bytes, step_len);
                 try rewriteIndirectCallToJump(bytes[0..@as(usize, step_len)], decoded);
                 try patchRipRelativeDisplacement(bytes[0..@as(usize, step_len)], decoded, emitter.currentPc());
+                // The trampoline already pushed the synthetic return address,
+                // so the relocated instruction intentionally becomes a jump.
                 try emitter.emit(bytes[0..@as(usize, step_len)]);
             }
         },
         .direct_jump => {
+            // No fallthrough path exists, so an absolute tail jump is enough.
             try emitter.emitAbsoluteJump(decoded.absolute_target);
         },
         .indirect_jump => {
@@ -258,6 +276,11 @@ pub fn createOriginalTrampoline(address: u64, original_bytes: []const u8, step_l
             //   jmp next_pc
             // taken_stub:
             //   jmp original_target
+            //
+            // Re-encoding the original condition preserves the flags contract.
+            // Both outcomes then branch into absolute jumps because the final
+            // destinations may no longer be encodable from the trampoline via a
+            // short or near relative displacement.
             var bytes = try copyInstruction(original_bytes, step_len);
             const branch_pc = emitter.currentPc();
             const taken_pc = branch_pc + step_len + 14;
@@ -284,10 +307,7 @@ pub fn createOriginalTrampoline(address: u64, original_bytes: []const u8, step_l
     return @intFromPtr(mapped.ptr);
 }
 
+/// Releases a trampoline previously created by `createOriginalTrampoline(...)`.
 pub fn freeOriginalTrampoline(trampoline_pc: u64) void {
-    if (trampoline_pc == 0) return;
-
-    const page_size = std.heap.pageSize();
-    const ptr: [*]align(std.heap.page_size_min) const u8 = @ptrFromInt(@as(usize, @intCast(trampoline_pc)));
-    std.posix.munmap(ptr[0..page_size]);
+    memory.freeTrampolinePage(trampoline_pc);
 }

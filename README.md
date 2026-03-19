@@ -66,6 +66,15 @@ x86_64 replay coverage:
 - `instrument_no_original(...)`: supported with automatic instruction-length
   decoding for runtime-installed hooks
 - `instrument(...)`: supported through Zydis-backed decode + trampoline replay
+- direct calls and direct jumps are replayed through synthetic absolute
+  trampoline control transfers
+- RIP-relative indirect calls and jumps are replayed through near trampoline
+  allocation plus relocated memory displacements
+- plain RIP-relative memory instructions such as `mov foo(%rip), %eax` are
+  replayed through relocated disp32 patching when a near trampoline page is
+  available
+- conditional branches are replayed through a local branch stub plus absolute
+  taken/fallthrough jumps
 - stack-pointer-based indirect calls such as `call *(%rsp)` are replayed
   through a synthetic push-plus-jump trampoline sequence
 - unsupported x86_64 execute-original cases still fail early with

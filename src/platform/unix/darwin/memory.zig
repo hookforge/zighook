@@ -1,11 +1,9 @@
-//! Apple-specific memory utilities.
-//!
-//! The current backend uses Mach page protection APIs for text patching because
-//! they work consistently for the in-process executable pages we need to modify.
+//! Darwin-family executable-memory helpers.
 
 const std = @import("std");
 
-const HookError = @import("../error.zig").HookError;
+const HookError = @import("../../../error.zig").HookError;
+const TrampolineKind = @import("../../types.zig").TrampolineKind;
 
 extern fn sys_icache_invalidate(start: *anyopaque, len: usize) void;
 
@@ -14,15 +12,12 @@ const ProtectRange = struct {
     len: usize,
 };
 
-/// Writes machine code bytes into an executable region.
+/// Writes raw machine code bytes into an executable page on Darwin-family
+/// systems.
 ///
-/// The caller is expected to:
-/// - validate the address range
-/// - preserve any original bytes it may need for later restoration
-///
-/// On Apple platforms we temporarily switch the page to writable copy-on-write
-/// protection, patch the bytes in-place, invalidate the instruction cache, and
-/// then restore RX permissions.
+/// Darwin enforces code-signing-aware page permission transitions through
+/// Mach VM APIs, so patching uses `mach_vm_protect` instead of plain POSIX
+/// `mprotect`.
 pub fn patchBytes(address: u64, bytes: []const u8) HookError!void {
     if (address == 0 or bytes.len == 0) return error.InvalidAddress;
 
@@ -32,6 +27,8 @@ pub fn patchBytes(address: u64, bytes: []const u8) HookError!void {
     const writable_prot = std.c.PROT.READ | std.c.PROT.WRITE | std.c.PROT.COPY;
     const restore_prot = std.c.PROT.READ | std.c.PROT.EXEC;
 
+    // The page range may span more than one page when the patch straddles a
+    // boundary, so compute and protect the entire enclosing region up front.
     const kr_writable = std.c.mach_vm_protect(
         std.c.mach_task_self(),
         protect_range.start,
@@ -55,9 +52,45 @@ pub fn patchBytes(address: u64, bytes: []const u8) HookError!void {
     if (kr_executable != 0) return error.PageProtectionChangeFailed;
 }
 
-/// Flushes the instruction cache for a range that has just been written as data.
 pub fn flushInstructionCache(address: [*]u8, len: usize) void {
     sys_icache_invalidate(address, len);
+}
+
+/// Allocates a writable trampoline page.
+///
+/// Darwin does not currently expose a special locality policy here. The
+/// caller still provides `address_hint` so future backends can choose a closer
+/// mapping strategy without changing the higher-level API.
+pub fn allocateTrampolinePage(address_hint: u64, _: TrampolineKind) HookError![]align(std.heap.page_size_min) u8 {
+    const page_size = std.heap.pageSize();
+    const page_mask = @as(u64, @intCast(page_size - 1));
+    const hint_addr = address_hint & ~page_mask;
+    const hint: ?[*]align(std.heap.page_size_min) u8 = if (hint_addr != 0)
+        @ptrFromInt(@as(usize, @intCast(hint_addr)))
+    else
+        null;
+
+    return std.posix.mmap(
+        hint,
+        page_size,
+        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{
+            .TYPE = .PRIVATE,
+            .ANONYMOUS = true,
+        },
+        -1,
+        0,
+    ) catch return error.TrampolineAllocationFailed;
+}
+
+/// Releases a trampoline page previously allocated by
+/// `allocateTrampolinePage(...)`.
+pub fn freeTrampolinePage(trampoline_pc: u64) void {
+    if (trampoline_pc == 0) return;
+
+    const page_size = std.heap.pageSize();
+    const ptr: [*]align(std.heap.page_size_min) const u8 = @ptrFromInt(@as(usize, @intCast(trampoline_pc)));
+    std.posix.munmap(ptr[0..page_size]);
 }
 
 fn computeProtectRange(address: usize, len: usize) ProtectRange {

@@ -1,10 +1,10 @@
 //! Public zighook API.
 //!
 //! `zighook` is an experimental runtime instrumentation library for
-//! signal-driven inline hooks and instruction hooks.
+//! trap-driven inline hooks and instruction hooks.
 //!
 //! The caller-facing design is intentionally small and entirely centered around
-//! `sigaction`-driven trap handling:
+//! process-global trap handling on the currently supported Unix backends:
 //! - `instrument(...)`: trap one instruction and then execute it
 //! - `instrument_no_original(...)`: trap one instruction and replace it
 //! - `inline_hook(...)`: trap a function entry and return directly to the caller
@@ -37,7 +37,7 @@ comptime {
 
 const memory = @import("memory.zig");
 const SavedInstruction = @import("saved_instruction.zig").SavedInstruction;
-const signal = @import("signal.zig");
+const platform_trap = @import("platform/trap_root.zig");
 const state = @import("state.zig");
 const arch = @import("arch/root.zig");
 
@@ -113,7 +113,7 @@ const InstallMode = enum {
 /// - x86_64 replaces the first byte with `int3` and pads the remaining bytes
 ///   of the displaced instruction with `nop`
 /// - the original instruction bytes are cached internally
-/// - signal handlers are installed lazily on the first successful hook
+/// - trap handlers are installed lazily on the first successful hook
 ///
 /// Resume behavior:
 /// - if `callback` overwrites `ctx.pc`, that explicit control-flow choice wins
@@ -465,7 +465,7 @@ fn instrumentInternal(
         return currentOriginalInstructionPrefix(address) orelse error.InvalidAddress;
     }
 
-    try signal.ensureHandlersInstalled();
+    try platform_trap.ensureHandlersInstalled();
     try arch.validateAddress(address);
 
     var cached_instruction = state.cachedOriginalInstruction(address);
@@ -475,6 +475,10 @@ fn instrumentInternal(
 
     switch (install_mode) {
         .runtime_patch => {
+            // Runtime patch mode can still read the live instruction bytes
+            // directly from the process image before replacing them with a
+            // trap, so it discovers both the replay bytes and the instruction
+            // length from the current text page.
             step_len = try arch.instructionWidth(address);
             restore_instruction = try readInstructionBytes(address, step_len);
             if (cached_instruction == null) {
@@ -482,6 +486,10 @@ fn instrumentInternal(
             }
         },
         .prepatched => {
+            // Prepatched mode starts from a binary that already contains a trap
+            // at `address`, so the executable page no longer holds the
+            // displaced instruction. Length and replay bytes may therefore
+            // need to come from caller-provided cached metadata instead.
             try ensurePrepatchedTrap(address);
             step_len = try resolveStepLen(address, return_to_caller, cached_instruction, install_mode);
             restore_instruction = try readInstructionBytes(address, arch.trapPatchBytes().len);
@@ -501,6 +509,9 @@ fn instrumentInternal(
         arch.ReplayPlan{ .skip = {} };
 
     if (install_mode == .runtime_patch) {
+        // Only mutate executable code after replay planning has already
+        // succeeded. That keeps unsupported opcodes from leaving behind a half-
+        // installed trap site.
         const trap_patch = try arch.makeTrapPatch(step_len);
         try memory.patchBytes(address, trap_patch.slice());
         runtime_patch_installed = true;
@@ -523,6 +534,9 @@ fn instrumentInternal(
     };
 
     if (cached_instruction) |instruction| {
+        // Store the caller-visible original bytes even for runtime-patched
+        // hooks so later `prepatched.*` registrations and diagnostics can
+        // query the same authoritative metadata.
         state.cacheOriginalInstruction(address, instruction);
     }
     return currentOriginalInstructionPrefix(address) orelse error.InvalidAddress;
