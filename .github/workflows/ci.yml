@@ -298,6 +298,9 @@ jobs:
       - name: Zig test
         run: zig build test
 
+      - name: Resolve Zydis bridge path
+        run: echo "ZYDIS_BRIDGE_C=$(./scripts/zydis-package-path.sh bridge-c)" >> "$GITHUB_ENV"
+
       - name: Example inline_hook_signal
         working-directory: examples/inline_hook_signal
         run: |
