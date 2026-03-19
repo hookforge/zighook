@@ -5,18 +5,35 @@ on:
     branches: ["**"]
   pull_request:
 
+env:
+  ZIG_VERSION: 0.15.2
+
 jobs:
   zig-macos-aarch64:
     runs-on: macos-14
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            macOS) archive="zig-aarch64-macos-${ZIG_VERSION}.tar.xz" ;;
+            Linux) archive="zig-aarch64-linux-${ZIG_VERSION}.tar.xz" ;;
+            *)
+              echo "unsupported runner OS: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+          tmpdir="$(mktemp -d)"
+          url="https://ziglang.org/download/${ZIG_VERSION}/${archive}"
+          curl -fsSL "$url" -o "$tmpdir/$archive"
+          tar -C "$tmpdir" -xf "$tmpdir/$archive"
+          echo "$tmpdir/${archive%.tar.xz}" >> "$GITHUB_PATH"
+          "$tmpdir/${archive%.tar.xz}/zig" version
 
       - name: Zig fmt
         run: zig fmt --check $(git ls-files '*.zig')
@@ -129,12 +146,26 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            macOS) archive="zig-aarch64-macos-${ZIG_VERSION}.tar.xz" ;;
+            Linux) archive="zig-aarch64-linux-${ZIG_VERSION}.tar.xz" ;;
+            *)
+              echo "unsupported runner OS: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+          tmpdir="$(mktemp -d)"
+          url="https://ziglang.org/download/${ZIG_VERSION}/${archive}"
+          curl -fsSL "$url" -o "$tmpdir/$archive"
+          tar -C "$tmpdir" -xf "$tmpdir/$archive"
+          echo "$tmpdir/${archive%.tar.xz}" >> "$GITHUB_PATH"
+          "$tmpdir/${archive%.tar.xz}/zig" version
 
       - name: Zig fmt
         run: zig fmt --check $(git ls-files '*.zig')
