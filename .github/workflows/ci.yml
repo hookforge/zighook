@@ -58,6 +58,20 @@ jobs:
             -Mzighook=src/root.zig \
             -lc
 
+      - name: Cross compile macOS x86_64 core and payload
+        run: |
+          set -euo pipefail
+          zig build-lib -dynamic -target x86_64-macos -OReleaseFast \
+            -femit-bin=/tmp/libzighook_macos_x86_64.dylib \
+            src/root.zig \
+            -lc
+          zig build-lib -dynamic -target x86_64-macos -OReleaseFast \
+            -femit-bin=/tmp/inline_hook_signal_macos_x86_64.dylib \
+            --dep zighook \
+            -Mroot=examples/inline_hook_signal/hook.zig \
+            -Mzighook=src/root.zig \
+            -lc
+
       - name: Cross compile iOS AArch64 core and payload
         run: |
           set -euo pipefail
@@ -228,6 +242,67 @@ jobs:
           output="$(LD_PRELOAD="$PWD/hook.so" ./target)"
           expected=$'hooked=123\nrestored=5'
           test "$output" = "$expected"
+
+      - name: Example prepatched_inline_hook
+        working-directory: examples/prepatched_inline_hook
+        run: |
+          set -euo pipefail
+          cc -O3 -DNDEBUG -rdynamic -o target target.c -ldl
+          zig build-lib -dynamic -OReleaseFast -femit-bin=hook.so \
+            --dep zighook \
+            -Mroot=hook.zig \
+            -Mzighook=../../src/root.zig \
+            -lc
+          output="$(LD_PRELOAD="$PWD/hook.so" ./target)"
+          test "$output" = "result=77"
+
+  zig-linux-x86_64:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            macOS) archive="zig-aarch64-macos-${ZIG_VERSION}.tar.xz" ;;
+            Linux) archive="zig-x86_64-linux-${ZIG_VERSION}.tar.xz" ;;
+            *)
+              echo "unsupported runner OS: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+          tmpdir="$(mktemp -d)"
+          url="https://ziglang.org/download/${ZIG_VERSION}/${archive}"
+          curl -fsSL "$url" -o "$tmpdir/$archive"
+          tar -C "$tmpdir" -xf "$tmpdir/$archive"
+          echo "$tmpdir/${archive%.tar.xz}" >> "$GITHUB_PATH"
+          "$tmpdir/${archive%.tar.xz}/zig" version
+
+      - name: Zig fmt
+        run: zig fmt --check $(git ls-files '*.zig')
+
+      - name: Zig build
+        run: zig build
+
+      - name: Zig test
+        run: zig build test
+
+      - name: Example inline_hook_signal
+        working-directory: examples/inline_hook_signal
+        run: |
+          set -euo pipefail
+          cc -O3 -DNDEBUG -rdynamic -o target target.c -ldl
+          zig build-lib -dynamic -OReleaseFast -femit-bin=hook.so \
+            --dep zighook \
+            -Mroot=hook.zig \
+            -Mzighook=../../src/root.zig \
+            -lc
+          output="$(LD_PRELOAD="$PWD/hook.so" ./target)"
+          test "$output" = "result=42"
 
       - name: Example prepatched_inline_hook
         working-directory: examples/prepatched_inline_hook

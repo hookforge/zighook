@@ -34,7 +34,12 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    integration_tests.root_module.addAssemblyFile(b.path("tests/support/runtime_targets_aarch64.S"));
+    const runtime_targets_path = switch (target.result.cpu.arch) {
+        .aarch64 => "tests/support/runtime_targets_aarch64.S",
+        .x86_64 => "tests/support/runtime_targets_x86_64.S",
+        else => @panic("integration tests only provide native runtime targets for AArch64 and x86_64"),
+    };
+    integration_tests.root_module.addAssemblyFile(b.path(runtime_targets_path));
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
     const test_step = b.step("test", "Run unit and integration tests");

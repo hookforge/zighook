@@ -13,7 +13,8 @@ const std = @import("std");
 
 const HookError = @import("error.zig").HookError;
 const constants = @import("constants.zig");
-const aarch64 = @import("arch/aarch64.zig");
+const SavedInstruction = @import("saved_instruction.zig").SavedInstruction;
+const arch = @import("arch/root.zig");
 
 /// Instrumentation slot used by trap-based APIs.
 pub const HookSlot = struct {
@@ -21,14 +22,14 @@ pub const HookSlot = struct {
     used: bool = false,
     /// Address of the patched or prepatched trap point.
     address: u64 = 0,
-    /// Cached original bytes that were replaced by the trap or need replay.
+    /// Bytes that must be written back when a runtime-installed trap is removed.
     original_bytes: [constants.max_saved_bytes]u8 = [_]u8{0} ** constants.max_saved_bytes,
-    /// Number of valid bytes stored in `original_bytes`.
+    /// Number of bytes in `original_bytes` that must be restored.
     original_len: u8 = 0,
-    /// Width of the trapped instruction in bytes.
+    /// Width of the displaced original instruction in bytes.
     step_len: u8 = 0,
     /// User callback invoked when the trap fires.
-    callback: ?aarch64.InstrumentCallback = null,
+    callback: ?arch.InstrumentCallback = null,
     /// Whether execution should replay the original instruction.
     execute_original: bool = false,
     /// Whether the callback should return directly to the caller when it leaves
@@ -37,20 +38,20 @@ pub const HookSlot = struct {
     /// Whether zighook itself installed the `brk` patch into the text page.
     runtime_patch_installed: bool = false,
     /// Precomputed execute-original strategy for the displaced instruction.
-    replay_plan: aarch64.ReplayPlan = .{ .skip = {} },
+    replay_plan: arch.ReplayPlan = .{ .skip = {} },
     /// Address of the replay trampoline, if one was allocated.
     trampoline_pc: u64 = 0,
 };
 
-const OriginalOpcodeSlot = struct {
+const OriginalInstructionSlot = struct {
     used: bool = false,
     address: u64 = 0,
-    opcode: u32 = 0,
+    instruction: SavedInstruction = .{},
 };
 
 var hook_slots: [constants.max_hooks]HookSlot = [_]HookSlot{.{}} ** constants.max_hooks;
-var original_opcode_slots: [constants.max_hooks]OriginalOpcodeSlot = [_]OriginalOpcodeSlot{.{}} ** constants.max_hooks;
-var original_opcode_replace_index: usize = 0;
+var original_instruction_slots: [constants.max_hooks]OriginalInstructionSlot = [_]OriginalInstructionSlot{.{}} ** constants.max_hooks;
+var original_instruction_replace_index: usize = 0;
 
 fn findHookIndex(address: u64) ?usize {
     for (hook_slots, 0..) |slot, index| {
@@ -66,8 +67,8 @@ fn findFreeHookIndex() ?usize {
     return null;
 }
 
-fn findOriginalOpcodeIndex(address: u64) ?usize {
-    for (original_opcode_slots, 0..) |slot, index| {
+fn findOriginalInstructionIndex(address: u64) ?usize {
+    for (original_instruction_slots, 0..) |slot, index| {
         if (slot.used and slot.address == address) return index;
     }
     return null;
@@ -83,11 +84,11 @@ pub fn registerHook(
     address: u64,
     original_bytes: []const u8,
     step_len: u8,
-    callback: aarch64.InstrumentCallback,
+    callback: arch.InstrumentCallback,
     execute_original: bool,
     return_to_caller: bool,
     runtime_patch_installed: bool,
-    replay_plan: aarch64.ReplayPlan,
+    replay_plan: arch.ReplayPlan,
 ) HookError!void {
     if (address == 0 or original_bytes.len == 0 or original_bytes.len > constants.max_saved_bytes or step_len == 0) {
         return error.InvalidAddress;
@@ -113,7 +114,7 @@ pub fn registerHook(
         if (execute_original and replay_plan.requiresTrampoline() and slot.trampoline_pc == 0) {
             // Trampolines are allocated lazily so `inline_hook(...)` and
             // `instrument_no_original(...)` do not pay RX memory overhead.
-            slot.trampoline_pc = try aarch64.createOriginalTrampoline(
+            slot.trampoline_pc = try arch.createOriginalTrampoline(
                 address,
                 slot.original_bytes[0..slot.original_len],
                 slot.step_len,
@@ -126,7 +127,7 @@ pub fn registerHook(
 
     const free_index = findFreeHookIndex() orelse return error.HookSlotsFull;
     const trampoline_pc = if (execute_original and replay_plan.requiresTrampoline())
-        try aarch64.createOriginalTrampoline(address, original_bytes, step_len)
+        try arch.createOriginalTrampoline(address, original_bytes, step_len)
     else
         0;
 
@@ -159,29 +160,28 @@ pub fn removeHook(address: u64) ?HookSlot {
     return slot;
 }
 
-/// Returns the original 32-bit instruction cached by a hook slot.
-pub fn hookOriginalOpcode(address: u64) ?u32 {
+/// Returns the restore bytes cached by a hook slot.
+pub fn hookOriginalInstruction(address: u64) ?SavedInstruction {
     const slot = slotByAddress(address) orelse return null;
-    if (slot.original_len < 4) return null;
-    return std.mem.readInt(u32, slot.original_bytes[0..4], .little);
+    return SavedInstruction.fromSlice(slot.original_bytes[0..slot.original_len]) catch null;
 }
 
-/// Stores an original opcode independently from the live hook slot registry.
+/// Stores original instruction bytes independently from the live hook slot registry.
 ///
 /// This is required by the `prepatched::*` APIs, where the executable page
 /// already contains a trap instruction at install time.
-pub fn cacheOriginalOpcode(address: u64, opcode: u32) void {
-    if (findOriginalOpcodeIndex(address)) |index| {
-        original_opcode_slots[index].opcode = opcode;
+pub fn cacheOriginalInstruction(address: u64, instruction: SavedInstruction) void {
+    if (findOriginalInstructionIndex(address)) |index| {
+        original_instruction_slots[index].instruction = instruction;
         return;
     }
 
-    for (original_opcode_slots, 0..) |slot, index| {
+    for (original_instruction_slots, 0..) |slot, index| {
         if (!slot.used) {
-            original_opcode_slots[index] = .{
+            original_instruction_slots[index] = .{
                 .used = true,
                 .address = address,
-                .opcode = opcode,
+                .instruction = instruction,
             };
             return;
         }
@@ -190,24 +190,24 @@ pub fn cacheOriginalOpcode(address: u64, opcode: u32) void {
     // If every slot is full, overwrite in round-robin order. This keeps the
     // storage fixed-size like the Rust crate and avoids heap allocation in
     // public registration paths.
-    const replace_index = original_opcode_replace_index % constants.max_hooks;
-    original_opcode_slots[replace_index] = .{
+    const replace_index = original_instruction_replace_index % constants.max_hooks;
+    original_instruction_slots[replace_index] = .{
         .used = true,
         .address = address,
-        .opcode = opcode,
+        .instruction = instruction,
     };
-    original_opcode_replace_index = (replace_index + 1) % constants.max_hooks;
+    original_instruction_replace_index = (replace_index + 1) % constants.max_hooks;
 }
 
-/// Returns a cached original opcode recorded independently from the hook slot.
-pub fn cachedOriginalOpcode(address: u64) ?u32 {
-    const index = findOriginalOpcodeIndex(address) orelse return null;
-    return original_opcode_slots[index].opcode;
+/// Returns cached original instruction bytes recorded independently from the hook slot.
+pub fn cachedOriginalInstruction(address: u64) ?SavedInstruction {
+    const index = findOriginalInstructionIndex(address) orelse return null;
+    return original_instruction_slots[index].instruction;
 }
 
-/// Removes a cached original opcode if present.
-pub fn removeCachedOriginalOpcode(address: u64) bool {
-    const index = findOriginalOpcodeIndex(address) orelse return false;
-    original_opcode_slots[index] = .{};
+/// Removes cached original instruction metadata if present.
+pub fn removeCachedOriginalInstruction(address: u64) bool {
+    const index = findOriginalInstructionIndex(address) orelse return false;
+    original_instruction_slots[index] = .{};
     return true;
 }

@@ -1,10 +1,11 @@
 # zighook examples
 
-These examples mirror the intent of the Rust `sighook` demos, but are currently
-implemented for the first completed AArch64 backend family:
+These examples mirror the intent of the Rust `sighook` demos.
 
-- **OS:** macOS / iOS / Linux / Android
-- **Architecture:** AArch64 / ARM64
+Current coverage:
+
+- **AArch64 / ARM64:** macOS / iOS / Linux / Android
+- **x86_64:** macOS / Linux first slice (`inline_hook_signal` and `prepatched_inline_hook`)
 
 Each example directory is intentionally a standalone mini-project with exactly:
 
@@ -36,17 +37,18 @@ zig build-lib -dynamic -OReleaseFast -femit-bin=hook.dylib \
 DYLD_INSERT_LIBRARIES=$PWD/hook.dylib ./target
 ```
 
-That exact command sequence is still the canonical **macOS runtime smoke**.
-For Linux / iOS / Android deployment workflows, see:
+That exact command sequence is still the canonical **macOS runtime smoke** for
+AArch64. On Linux, CI runs both AArch64 and x86_64 runtime smokes. For Linux /
+iOS / Android deployment workflows, see:
 
 - `../docs/platform-workflows.md`
 
 Available examples:
 
 - `inline_hook_signal`: function-entry trap hook, expected output `result=42`
-- `instrument_with_original`: trap one instruction, edit registers, replay it, expected output `result=42`
-- `instrument_no_original`: trap one instruction and replace it, expected output `result=99`
-- `instrument_unhook_restore`: install a trap hook, call `unhook`, and confirm restoration, expected output `hooked=123` then `restored=5`
+- `instrument_with_original`: trap one instruction, edit registers, replay it, expected output `result=42` (AArch64 today)
+- `instrument_no_original`: trap one instruction and replace it, expected output `result=99` (AArch64 today)
+- `instrument_unhook_restore`: install a trap hook, call `unhook`, and confirm restoration, expected output `hooked=123` then `restored=5` (AArch64 today)
 - `prepatched_inline_hook`: use `prepatched.inline_hook(...)` on a binary that already contains `brk`, expected output `result=77`
 
 Each example README contains the exact commands and expected output. CI executes

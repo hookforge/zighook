@@ -2,6 +2,7 @@
 
 /// AArch64 `brk #0`.
 pub const brk_opcode: u32 = 0xD420_0000;
+pub const brk_bytes = [_]u8{ 0x00, 0x00, 0x20, 0xD4 };
 
 /// Mask used to recognize any `brk #imm16`.
 pub const brk_mask: u32 = 0xFFE0_001F;

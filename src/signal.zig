@@ -12,9 +12,8 @@
 const std = @import("std");
 
 const HookError = @import("error.zig").HookError;
-const aarch64 = @import("arch/aarch64.zig");
+const arch = @import("arch/root.zig");
 const state = @import("state.zig");
-const memory = @import("memory.zig");
 
 var handlers_installed = false;
 var prev_sigtrap_action: ?std.c.Sigaction = null;
@@ -78,14 +77,14 @@ fn chainPrevious(signum: c_int, info: *const std.c.siginfo_t, uctx: ?*anyopaque)
     previous_handler(signum);
 }
 
-/// Applies the runtime hook policy for a trapped AArch64 instruction.
+/// Applies the runtime hook policy for a trapped instruction.
 ///
 /// Callback contract:
 /// - if the callback overwrites `ctx.pc`, zighook respects that decision
-/// - otherwise `inline_hook` returns to `lr`
+/// - otherwise `inline_hook` returns to the caller using the current ISA ABI
 /// - otherwise `instrument` uses the precomputed replay plan
 /// - otherwise `instrument_no_original` skips to the next instruction
-fn handleTrapAarch64(address: u64, ctx: *aarch64.HookContext) bool {
+fn handleTrap(address: u64, ctx: *arch.HookContext) bool {
     const slot = state.slotByAddress(address) orelse return false;
     const callback = slot.callback orelse return false;
 
@@ -95,7 +94,7 @@ fn handleTrapAarch64(address: u64, ctx: *aarch64.HookContext) bool {
     if (ctx.pc != original_pc) return true;
 
     if (slot.return_to_caller) {
-        ctx.pc = ctx.regs.named.x30;
+        arch.returnToCaller(ctx) catch return false;
         return true;
     }
 
@@ -104,7 +103,7 @@ fn handleTrapAarch64(address: u64, ctx: *aarch64.HookContext) bool {
         if (slot.replay_plan.requiresTrampoline()) {
             ctx.pc = slot.trampoline_pc;
         } else {
-            aarch64.applyReplay(slot.replay_plan, address, ctx) catch return false;
+            arch.applyReplay(slot.replay_plan, address, ctx) catch return false;
         }
     } else {
         ctx.pc = next_pc;
@@ -121,27 +120,27 @@ fn handleTrapAarch64(address: u64, ctx: *aarch64.HookContext) bool {
 /// - dispatch to the registered callback
 /// - write the edited context back so execution resumes as requested
 fn trapHandler(signum: c_int, info: *const std.c.siginfo_t, uctx_opaque: ?*anyopaque) callconv(.c) void {
-    var ctx = aarch64.captureMachineContext(uctx_opaque) orelse {
+    var ctx = arch.captureMachineContext(uctx_opaque) orelse {
         chainPrevious(signum, info, uctx_opaque);
         return;
     };
-    const trap_address = ctx.pc;
+    const trap_address = arch.trapAddress(&ctx) catch {
+        chainPrevious(signum, info, uctx_opaque);
+        return;
+    };
+    arch.normalizeTrapContext(&ctx, trap_address);
 
-    const opcode = memory.readU32(trap_address) catch {
-        chainPrevious(signum, info, uctx_opaque);
-        return;
-    };
-    if (!aarch64.isBrk(opcode)) {
+    if (!(arch.isTrapInstruction(trap_address) catch false)) {
         chainPrevious(signum, info, uctx_opaque);
         return;
     }
 
-    if (!handleTrapAarch64(trap_address, &ctx)) {
+    if (!handleTrap(trap_address, &ctx)) {
         chainPrevious(signum, info, uctx_opaque);
         return;
     }
 
-    if (!aarch64.writeBackMachineContext(uctx_opaque, &ctx)) {
+    if (!arch.writeBackMachineContext(uctx_opaque, &ctx)) {
         chainPrevious(signum, info, uctx_opaque);
     }
 }

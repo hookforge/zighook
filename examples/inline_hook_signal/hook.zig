@@ -17,8 +17,16 @@ fn rtldDefault() ?*anyopaque {
     };
 }
 
+fn setReturnValue(ctx: *zighook.HookContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .aarch64 => ctx.regs.named.x0 = value,
+        .x86_64 => ctx.regs.named.rax = value,
+        else => @compileError("example payload only supports AArch64 and x86_64"),
+    }
+}
+
 fn onHit(_: u64, ctx: *zighook.HookContext) callconv(.c) void {
-    ctx.regs.named.x0 = 42;
+    setReturnValue(ctx, 42);
 }
 
 fn install() callconv(.c) void {
