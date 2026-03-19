@@ -8,26 +8,31 @@ const LinuxMContext = linux.mcontext_t;
 
 const types = @import("types.zig");
 
+/// Linux x86_64 stores the architectural segment selectors inside the packed
+/// `REG.CSGSFS` greg slot. Keeping this layout explicit makes the trap-frame
+/// mapping much easier to audit against the kernel ABI:
+/// - bits 0..15   = CS
+/// - bits 16..31  = GS
+/// - bits 32..47  = FS
+/// - bits 48..63  = SS
+///
+/// Recent kernels set `UC_SIGCONTEXT_SS` / `UC_STRICT_RESTORE_SS`, which means
+/// the top 16 bits are no longer padding for ordinary 64-bit signal delivery.
+/// We therefore preserve the full packed value instead of reconstructing only
+/// `cs`, `gs`, and `fs`.
+const SegmentSelectors = packed struct(u64) {
+    cs: u16,
+    gs: u16,
+    fs: u16,
+    ss: u16,
+};
+
 fn readU128(bytes: []const u8) u128 {
     return std.mem.readInt(u128, bytes[0..16], .little);
 }
 
 fn writeU128(bytes: []u8, value: u128) void {
     std.mem.writeInt(u128, bytes[0..16], value, .little);
-}
-
-fn readCsGsFs(packed_value: usize) struct { cs: u64, gs: u64, fs: u64 } {
-    return .{
-        .cs = @truncate(packed_value & 0xFFFF),
-        .gs = @truncate((packed_value >> 16) & 0xFFFF),
-        .fs = @truncate((packed_value >> 32) & 0xFFFF),
-    };
-}
-
-fn packCsGsFs(ctx: *const types.HookContext) usize {
-    return @as(usize, @intCast(ctx.cs & 0xFFFF)) |
-        (@as(usize, @intCast(ctx.gs & 0xFFFF)) << 16) |
-        (@as(usize, @intCast(ctx.fs & 0xFFFF)) << 32);
 }
 
 fn captureFromMcontext(mcontext: *const LinuxMContext) types.HookContext {
@@ -52,10 +57,11 @@ fn captureFromMcontext(mcontext: *const LinuxMContext) types.HookContext {
     ctx.pc = @intCast(mcontext.gregs[REG.RIP]);
     ctx.flags = @intCast(mcontext.gregs[REG.EFL]);
 
-    const selectors = readCsGsFs(mcontext.gregs[REG.CSGSFS]);
+    const selectors: SegmentSelectors = @bitCast(@as(u64, @intCast(mcontext.gregs[REG.CSGSFS])));
     ctx.cs = selectors.cs;
     ctx.gs = selectors.gs;
     ctx.fs = selectors.fs;
+    ctx.ss = selectors.ss;
 
     if (@intFromPtr(mcontext.fpregs) != 0) {
         for (mcontext.fpregs.xmm, 0..) |xmm, index| {
@@ -86,7 +92,13 @@ fn writeBackToMcontext(mcontext: *LinuxMContext, ctx: *const types.HookContext) 
     mcontext.gregs[REG.RSP] = @intCast(ctx.sp);
     mcontext.gregs[REG.RIP] = @intCast(ctx.pc);
     mcontext.gregs[REG.EFL] = @intCast(ctx.flags);
-    mcontext.gregs[REG.CSGSFS] = packCsGsFs(ctx);
+    const selectors = SegmentSelectors{
+        .cs = @truncate(ctx.cs),
+        .gs = @truncate(ctx.gs),
+        .fs = @truncate(ctx.fs),
+        .ss = @truncate(ctx.ss),
+    };
+    mcontext.gregs[REG.CSGSFS] = @intCast(@as(u64, @bitCast(selectors)));
 
     if (@intFromPtr(mcontext.fpregs) != 0) {
         for (ctx.fpregs.xmm, 0..) |xmm, index| {
@@ -136,7 +148,10 @@ test "Linux x86_64 signal context remaps GPRs and XMM state" {
     mcontext.gregs[REG.RSP] = 16;
     mcontext.gregs[REG.RIP] = 17;
     mcontext.gregs[REG.EFL] = 18;
-    mcontext.gregs[REG.CSGSFS] = 0x0033 | (@as(usize, 0x0044) << 16) | (@as(usize, 0x0055) << 32);
+    mcontext.gregs[REG.CSGSFS] = 0x0033 |
+        (@as(usize, 0x0044) << 16) |
+        (@as(usize, 0x0055) << 32) |
+        (@as(usize, 0x0066) << 48);
     writeU128(std.mem.asBytes(&fpstate.xmm[0]), 0x1122_3344_5566_7788);
     writeU128(std.mem.asBytes(&fpstate.xmm[15]), (@as(u128, 0xAAAA_BBBB_CCCC_DDDD) << 64) | 0xEEEE_FFFF_0000_1111);
     fpstate.mxcsr = 0x6666;
@@ -151,6 +166,7 @@ test "Linux x86_64 signal context remaps GPRs and XMM state" {
     try std.testing.expectEqual(@as(u64, 0x33), ctx.cs);
     try std.testing.expectEqual(@as(u64, 0x44), ctx.gs);
     try std.testing.expectEqual(@as(u64, 0x55), ctx.fs);
+    try std.testing.expectEqual(@as(u64, 0x66), ctx.ss);
     try std.testing.expectEqual(@as(u128, 0x1122_3344_5566_7788), ctx.fpregs.named.xmm0);
     try std.testing.expectEqual((@as(u128, 0xAAAA_BBBB_CCCC_DDDD) << 64) | 0xEEEE_FFFF_0000_1111, ctx.fpregs.named.xmm15);
     try std.testing.expectEqual(@as(u32, 0x6666), ctx.mxcsr);
@@ -163,6 +179,7 @@ test "Linux x86_64 signal context remaps GPRs and XMM state" {
     ctx.cs = 0x77;
     ctx.gs = 0x88;
     ctx.fs = 0x99;
+    ctx.ss = 0xAA;
     ctx.fpregs.named.xmm0 = 0xABCD_EF01_2345_6789;
     ctx.fpregs.named.xmm15 = (@as(u128, 0x1234_5678_9ABC_DEF0) << 64) | 0x0FED_CBA9_8765_4321;
     ctx.mxcsr = 0x3333;
@@ -174,7 +191,13 @@ test "Linux x86_64 signal context remaps GPRs and XMM state" {
     try std.testing.expectEqual(@as(usize, 0xCAFE), mcontext.gregs[REG.RSP]);
     try std.testing.expectEqual(@as(usize, 0x1111), mcontext.gregs[REG.RIP]);
     try std.testing.expectEqual(@as(usize, 0x2222), mcontext.gregs[REG.EFL]);
-    try std.testing.expectEqual(@as(usize, 0x77) | (@as(usize, 0x88) << 16) | (@as(usize, 0x99) << 32), mcontext.gregs[REG.CSGSFS]);
+    try std.testing.expectEqual(
+        @as(usize, 0x77) |
+            (@as(usize, 0x88) << 16) |
+            (@as(usize, 0x99) << 32) |
+            (@as(usize, 0xAA) << 48),
+        mcontext.gregs[REG.CSGSFS],
+    );
     try std.testing.expectEqual(@as(u128, 0xABCD_EF01_2345_6789), readU128(std.mem.asBytes(&fpstate.xmm[0])));
     try std.testing.expectEqual((@as(u128, 0x1234_5678_9ABC_DEF0) << 64) | 0x0FED_CBA9_8765_4321, readU128(std.mem.asBytes(&fpstate.xmm[15])));
     try std.testing.expectEqual(@as(u32, 0x3333), fpstate.mxcsr);

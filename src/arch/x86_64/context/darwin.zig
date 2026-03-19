@@ -36,8 +36,9 @@ fn captureFromMcontext(mcontext: *const std.c.mcontext_t) types.HookContext {
     ctx.pc = mcontext.ss.rip;
     ctx.flags = mcontext.ss.rflags;
     ctx.cs = mcontext.ss.cs;
-    ctx.fs = mcontext.ss.fs;
     ctx.gs = mcontext.ss.gs;
+    ctx.fs = mcontext.ss.fs;
+    ctx.ss = 0;
 
     for (mcontext.fs.xmm, 0..) |xmm, index| {
         ctx.fpregs.xmm[index] = readU128(xmm[0..]);
@@ -66,8 +67,8 @@ fn writeBackToMcontext(mcontext: *std.c.mcontext_t, ctx: *const types.HookContex
     mcontext.ss.rip = ctx.pc;
     mcontext.ss.rflags = ctx.flags;
     mcontext.ss.cs = ctx.cs;
-    mcontext.ss.fs = ctx.fs;
     mcontext.ss.gs = ctx.gs;
+    mcontext.ss.fs = ctx.fs;
 
     for (ctx.fpregs.xmm, 0..) |xmm, index| {
         writeU128(mcontext.fs.xmm[index][0..], xmm);
