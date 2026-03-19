@@ -1,7 +1,21 @@
+const builtin = @import("builtin");
 const zighook = @import("zighook");
-const c = @cImport({
-    @cInclude("dlfcn.h");
-});
+
+const init_section = switch (builtin.os.tag) {
+    .macos, .ios => "__DATA,__mod_init_func",
+    .linux => ".init_array",
+    else => @compileError("example payload constructors are only implemented for Mach-O and ELF targets."),
+};
+
+extern fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
+
+fn rtldDefault() ?*anyopaque {
+    return switch (builtin.os.tag) {
+        .macos, .ios => @ptrFromInt(@as(usize, @bitCast(@as(isize, -2)))),
+        .linux => null,
+        else => @compileError("RTLD_DEFAULT is only implemented for Mach-O and ELF targets."),
+    };
+}
 
 var patchpoint_addr: u64 = 0;
 
@@ -10,7 +24,7 @@ fn onHit(_: u64, ctx: *zighook.HookContext) callconv(.c) void {
 }
 
 fn install() callconv(.c) void {
-    const symbol = c.dlsym(c.RTLD_DEFAULT, "target_add_patchpoint");
+    const symbol = dlsym(rtldDefault(), "target_add_patchpoint");
     if (symbol == null) return;
 
     patchpoint_addr = @intFromPtr(symbol.?);
@@ -23,4 +37,4 @@ pub export fn zighook_example_unhook() callconv(.c) void {
 }
 
 const InitFn = *const fn () callconv(.c) void;
-pub export const example_init: InitFn linksection("__DATA,__mod_init_func") = &install;
+pub export const example_init: InitFn linksection(init_section) = &install;

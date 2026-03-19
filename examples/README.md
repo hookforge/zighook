@@ -1,10 +1,10 @@
 # zighook examples
 
 These examples mirror the intent of the Rust `sighook` demos, but are currently
-implemented only for the first completed backend slice:
+implemented for the first completed AArch64 backend family:
 
-- **OS:** macOS
-- **Architecture:** Apple Silicon / AArch64
+- **OS:** macOS / iOS / Linux / Android
+- **Architecture:** AArch64 / ARM64
 
 Each example directory is intentionally a standalone mini-project with exactly:
 
@@ -15,7 +15,12 @@ Each example directory is intentionally a standalone mini-project with exactly:
 The root `build.zig` does not build examples. That is deliberate: the example
 directories are meant to show the real commands needed to compile a release C
 target, compile a release Zig hook dylib, and inject that dylib with
-`DYLD_INSERT_LIBRARIES`.
+platform-appropriate sidecar loading.
+
+The example payloads now auto-select the constructor section:
+
+- Mach-O (`macOS`, `iOS`): `__DATA,__mod_init_func`
+- ELF (`Linux`, `Android`): `.init_array`
 
 Common build pattern from inside an example directory:
 
@@ -31,6 +36,11 @@ zig build-lib -dynamic -OReleaseFast -femit-bin=hook.dylib \
 DYLD_INSERT_LIBRARIES=$PWD/hook.dylib ./target
 ```
 
+That exact command sequence is still the canonical **macOS runtime smoke**.
+For Linux / iOS / Android deployment workflows, see:
+
+- `../docs/platform-workflows.md`
+
 Available examples:
 
 - `inline_hook_signal`: function-entry trap hook, expected output `result=42`
@@ -40,4 +50,5 @@ Available examples:
 - `prepatched_inline_hook`: use `prepatched.inline_hook(...)` on a binary that already contains `brk`, expected output `result=77`
 
 Each example README contains the exact commands and expected output. CI executes
-the same commands directly and compares stdout against those documented values.
+the macOS runtime commands directly and compares stdout against those
+documented values.

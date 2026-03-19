@@ -78,5 +78,6 @@
         "src",
         "tests",
         "examples",
+        "docs",
     },
 }

@@ -1,13 +1,13 @@
-//! Apple-specific memory utilities.
+//! Linux / Android executable-memory patch helpers.
 //!
-//! The current backend uses Mach page protection APIs for text patching because
-//! they work consistently for the in-process executable pages we need to modify.
+//! Android follows the Linux AArch64 kernel ABI and the same `mprotect` +
+//! instruction-cache invalidation strategy works for sidecar `.so` payloads.
 
 const std = @import("std");
 
 const HookError = @import("../error.zig").HookError;
 
-extern fn sys_icache_invalidate(start: *anyopaque, len: usize) void;
+extern fn __clear_cache(start: [*]u8, end: [*]u8) void;
 
 const ProtectRange = struct {
     start: usize,
@@ -15,49 +15,32 @@ const ProtectRange = struct {
 };
 
 /// Writes machine code bytes into an executable region.
-///
-/// The caller is expected to:
-/// - validate the address range
-/// - preserve any original bytes it may need for later restoration
-///
-/// On Apple platforms we temporarily switch the page to writable copy-on-write
-/// protection, patch the bytes in-place, invalidate the instruction cache, and
-/// then restore RX permissions.
 pub fn patchBytes(address: u64, bytes: []const u8) HookError!void {
     if (address == 0 or bytes.len == 0) return error.InvalidAddress;
 
     const address_usize: usize = @intCast(address);
     const protect_range = computeProtectRange(address_usize, bytes.len);
 
-    const writable_prot = std.c.PROT.READ | std.c.PROT.WRITE | std.c.PROT.COPY;
+    const writable_prot = std.c.PROT.READ | std.c.PROT.WRITE | std.c.PROT.EXEC;
     const restore_prot = std.c.PROT.READ | std.c.PROT.EXEC;
 
-    const kr_writable = std.c.mach_vm_protect(
-        std.c.mach_task_self(),
-        protect_range.start,
-        protect_range.len,
-        0,
-        writable_prot,
-    );
-    if (kr_writable != 0) return error.PageProtectionChangeFailed;
+    const start_ptr: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(protect_range.start);
+    if (std.c.mprotect(start_ptr, protect_range.len, writable_prot) != 0) {
+        return error.PageProtectionChangeFailed;
+    }
 
     const destination: [*]u8 = @ptrFromInt(address_usize);
     @memcpy(destination[0..bytes.len], bytes);
     flushInstructionCache(destination, bytes.len);
 
-    const kr_executable = std.c.mach_vm_protect(
-        std.c.mach_task_self(),
-        protect_range.start,
-        protect_range.len,
-        0,
-        restore_prot,
-    );
-    if (kr_executable != 0) return error.PageProtectionChangeFailed;
+    if (std.c.mprotect(start_ptr, protect_range.len, restore_prot) != 0) {
+        return error.PageProtectionChangeFailed;
+    }
 }
 
 /// Flushes the instruction cache for a range that has just been written as data.
 pub fn flushInstructionCache(address: [*]u8, len: usize) void {
-    sys_icache_invalidate(address, len);
+    __clear_cache(address, address + len);
 }
 
 fn computeProtectRange(address: usize, len: usize) ProtectRange {

@@ -6,6 +6,13 @@ The C target already contains a `brk #0` instruction at the function entry, so
 the hook library only needs to register runtime state for that address. The
 callback returns a synthetic value directly to the caller.
 
+This is also the recommended template for the iOS deployment model:
+
+- prepatch the target Mach-O offline
+- build the payload as a dylib
+- insert that dylib into the app bundle
+- re-sign and install the app
+
 ## Build
 
 ```bash

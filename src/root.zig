@@ -20,8 +20,13 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 comptime {
-    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
-        @compileError("zighook currently implements only the macOS AArch64 backend.");
+    const supported_os = switch (builtin.os.tag) {
+        .macos, .ios, .linux => true,
+        else => false,
+    };
+
+    if (!supported_os or builtin.cpu.arch != .aarch64) {
+        @compileError("zighook currently implements AArch64 backends for macOS, iOS, Linux, and Android (Linux OS tag with Android ABI).");
     }
 }
 

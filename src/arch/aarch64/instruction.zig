@@ -44,7 +44,7 @@
 
 const std = @import("std");
 
-const HookContext = @import("context.zig").HookContext;
+const HookContext = @import("context/root.zig").HookContext;
 const HookError = @import("../../error.zig").HookError;
 
 /// Replay plan chosen for a displaced AArch64 instruction.

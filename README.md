@@ -5,7 +5,10 @@
 Current scope:
 
 - macOS
-- Apple Silicon / AArch64
+- iOS
+- Linux
+- Android
+- AArch64 / ARM64
 
 Implemented APIs:
 
@@ -24,15 +27,30 @@ The current backend supports:
 - signal-based entry hooks
 - strict execute-original replay for common AArch64 PC-relative instructions
 - public callback access to AArch64 FP/SIMD state (`fpregs.v[i]`, `fpregs.named.v0..v31`, `fpsr`, `fpcr`)
-- constructor-based dylib payloads for `DYLD_INSERT_LIBRARIES` / later Mach-O insertion workflows
+- constructor-based payloads for both Mach-O (`__mod_init_func`) and ELF (`.init_array`)
 
 ## Status
 
-This repository currently targets the first backend slice only:
+Implemented AArch64 platform backends:
 
-- `aarch64-apple-darwin`
+- `aarch64-macos`
+- `aarch64-ios`
+- `aarch64-linux`
+- `aarch64-linux-android` at the code/backend level via the Linux-family signal path
 
-It is usable for local experiments on Apple Silicon macOS, but it is not yet at full feature/platform parity with the Rust crate.
+Verification status:
+
+- macOS AArch64: runtime-tested locally and in CI
+- Linux AArch64: cross-compiled core library and ELF payload locally
+- iOS AArch64: cross-compiled core dylib and Mach-O payload locally
+- Android AArch64: compiled core/payload objects against a local NDK sysroot
+
+Deployment model by platform:
+
+- macOS: runtime patching or prepatched trap sites, usually with `DYLD_INSERT_LIBRARIES`
+- Linux: runtime patching or prepatched trap sites, usually with `LD_PRELOAD` or `patchelf`
+- iOS: recommended prepatched trap sites plus inserted dylib + re-sign
+- Android: Linux-family backend plus sidecar `.so`, typically loaded via patched ELF metadata / app packaging
 
 Current execute-original replay whitelist for PC-relative AArch64 instructions:
 
@@ -94,6 +112,10 @@ zig build-lib -dynamic -OReleaseFast -femit-bin=hook.dylib \
 DYLD_INSERT_LIBRARIES=$PWD/hook.dylib ./target
 ```
 
+For Linux, iOS, and Android deployment flows, see:
+
+- `docs/platform-workflows.md`
+
 Available examples:
 
 - `inline_hook_signal`: function-entry trap hook, expected output `result=42`
@@ -106,6 +128,7 @@ CI runs these exact per-directory build commands and compares exact stdout.
 
 See:
 
+- `docs/platform-workflows.md`
 - `examples/README.md`
 - each `examples/*/README.md`
 

@@ -27,6 +27,37 @@ jobs:
       - name: Zig test
         run: zig build test
 
+      - name: Cross compile Linux AArch64 core and payload
+        run: |
+          set -euo pipefail
+          zig build-lib -dynamic -target aarch64-linux-musl -OReleaseFast \
+            -femit-bin=/tmp/libzighook_linux.so \
+            src/root.zig \
+            -lc
+          zig build-lib -dynamic -target aarch64-linux-musl -OReleaseFast \
+            -femit-bin=/tmp/prepatched_hook_linux.so \
+            --dep zighook \
+            -Mroot=examples/prepatched_inline_hook/hook.zig \
+            -Mzighook=src/root.zig \
+            -lc
+
+      - name: Cross compile iOS AArch64 core and payload
+        run: |
+          set -euo pipefail
+          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          zig build-lib -dynamic -target aarch64-ios -OReleaseFast \
+            -femit-bin=/tmp/libzighook_ios.dylib \
+            src/root.zig \
+            -L"$IOS_SDK/usr/lib" \
+            -lc
+          zig build-lib -dynamic -target aarch64-ios -OReleaseFast \
+            -femit-bin=/tmp/prepatched_hook_ios.dylib \
+            --dep zighook \
+            -Mroot=examples/prepatched_inline_hook/hook.zig \
+            -Mzighook=src/root.zig \
+            -L"$IOS_SDK/usr/lib" \
+            -lc
+
       - name: Example inline_hook_signal
         working-directory: examples/inline_hook_signal
         run: |

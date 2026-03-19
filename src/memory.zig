@@ -43,7 +43,8 @@ pub fn patchU32(address: u64, new_opcode: u32) HookError!u32 {
 /// - restoring executable protection
 pub fn patchBytes(address: u64, bytes: []const u8) HookError!void {
     return switch (builtin.os.tag) {
-        .macos => @import("platform/apple.zig").patchBytes(address, bytes),
+        .macos, .ios => @import("platform/apple.zig").patchBytes(address, bytes),
+        .linux => @import("platform/linux.zig").patchBytes(address, bytes),
         else => error.UnsupportedPlatform,
     };
 }
@@ -54,7 +55,8 @@ pub fn patchBytes(address: u64, bytes: []const u8) HookError!void {
 /// the CPU may continue executing stale instructions fetched before the patch.
 pub fn flushInstructionCache(address: [*]u8, len: usize) void {
     switch (builtin.os.tag) {
-        .macos => @import("platform/apple.zig").flushInstructionCache(address, len),
+        .macos, .ios => @import("platform/apple.zig").flushInstructionCache(address, len),
+        .linux => @import("platform/linux.zig").flushInstructionCache(address, len),
         else => {},
     }
 }

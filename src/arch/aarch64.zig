@@ -6,7 +6,7 @@
 
 const HookError = @import("../error.zig").HookError;
 const arch_constants = @import("aarch64/constants.zig");
-const arch_context = @import("aarch64/context.zig");
+const arch_context = @import("aarch64/context/root.zig");
 const arch_instruction = @import("aarch64/instruction.zig");
 const arch_trampoline = @import("aarch64/trampoline.zig");
 

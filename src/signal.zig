@@ -115,23 +115,16 @@ fn handleTrapAarch64(address: u64, ctx: *aarch64.HookContext) bool {
 /// Process-wide `SIGTRAP` / `SIGILL` handler used by the current backend.
 ///
 /// The handler does not allocate and only performs a small amount of work:
-/// - recover the trapped PC from `ucontext`
-/// - copy Darwin machine state into the public callback layout
+/// - recover the trapped PC from the OS signal frame
+/// - copy native machine state into the public callback layout
 /// - verify that the instruction at that PC is still `brk`
 /// - dispatch to the registered callback
 /// - write the edited context back so execution resumes as requested
 fn trapHandler(signum: c_int, info: *const std.c.siginfo_t, uctx_opaque: ?*anyopaque) callconv(.c) void {
-    if (uctx_opaque == null) {
+    var ctx = aarch64.captureMachineContext(uctx_opaque) orelse {
         chainPrevious(signum, info, uctx_opaque);
         return;
-    }
-
-    // Darwin may hand signal handlers a context pointer that is not naturally
-    // aligned for Zig's `ucontext_t` view. Follow the same defensive pattern
-    // used by `std.debug` and treat the outer frame as byte-aligned.
-    const uctx: *align(1) std.c.ucontext_t = @ptrCast(uctx_opaque.?);
-    const mcontext = uctx.mcontext;
-    var ctx = aarch64.captureMachineContext(mcontext);
+    };
     const trap_address = ctx.pc;
 
     const opcode = memory.readU32(trap_address) catch {
@@ -148,7 +141,9 @@ fn trapHandler(signum: c_int, info: *const std.c.siginfo_t, uctx_opaque: ?*anyop
         return;
     }
 
-    aarch64.writeBackMachineContext(mcontext, &ctx);
+    if (!aarch64.writeBackMachineContext(uctx_opaque, &ctx)) {
+        chainPrevious(signum, info, uctx_opaque);
+    }
 }
 
 fn installSignal(signum: c_int) HookError!void {
