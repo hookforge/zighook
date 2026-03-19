@@ -50,5 +50,5 @@ Available examples:
 - `prepatched_inline_hook`: use `prepatched.inline_hook(...)` on a binary that already contains `brk`, expected output `result=77`
 
 Each example README contains the exact commands and expected output. CI executes
-the macOS runtime commands directly and compares stdout against those
-documented values.
+the documented runtime smokes on both macOS and Linux and compares stdout
+against those values.

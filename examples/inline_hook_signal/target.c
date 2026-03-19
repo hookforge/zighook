@@ -1,10 +1,18 @@
 #include <stdio.h>
 
+#if defined(__APPLE__)
+#define ASM_GLOBAL(name) ".globl _" #name "\n"
+#define ASM_LABEL(name) "_" #name ":\n"
+#else
+#define ASM_GLOBAL(name) ".globl " #name "\n"
+#define ASM_LABEL(name) #name ":\n"
+#endif
+
 __asm__(
 ".text\n"
 ".p2align 2\n"
-".globl _target_add\n"
-"_target_add:\n"
+ASM_GLOBAL(target_add)
+ASM_LABEL(target_add)
 "add w0, w0, w1\n"
 "ret\n"
 );

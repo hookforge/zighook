@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    integration_tests.root_module.addAssemblyFile(b.path("tests/support/runtime_targets_aarch64_macos.S"));
+    integration_tests.root_module.addAssemblyFile(b.path("tests/support/runtime_targets_aarch64.S"));
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
     const test_step = b.step("test", "Run unit and integration tests");
